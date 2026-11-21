@@ -304,7 +304,8 @@ const FD = (function () {
     // 3) 수급 (외국인+기관, 거래대금 대비)
     const r5 = tv20 > 0 ? flow5 / tv20 : 0, r20 = tv20 > 0 ? flow20 / tv20 : 0;
     const both = f5 > 0 && i5 > 0 ? 100 : f5 > 0 || i5 > 0 ? 50 : 0;
-    const flow = 0.4 * scale(r5, -0.4, 0.8) + 0.35 * scale(r20, -1, 2) + 0.15 * (streak / 5) * 100 + 0.1 * both;
+    const noFlow = !!st.noFlow;
+    const flow = noFlow ? 50 : 0.4 * scale(r5, -0.4, 0.8) + 0.35 * scale(r20, -1, 2) + 0.15 * (streak / 5) * 100 + 0.1 * both;
 
     // 4) 거래량
     const vs = scale(vr, 0.7, 1.8);
@@ -314,11 +315,12 @@ const FD = (function () {
     const risk = 0.4 * (100 - scale(vol20, 1, 4)) + 0.3 * scale(dd, -0.25, 0) + 0.3 * (100 - scale(overext, 0.06, 0.2));
 
     const parts = { trend, mom, flow, vol, risk };
-    const wsum = W.trend + W.flow + W.mom + W.vol + W.risk || 1;
-    const total = (W.trend * trend + W.flow * flow + W.mom * mom + W.vol * vol + W.risk * risk) / wsum;
+    const wf = noFlow ? 0 : W.flow;
+    const wsum = W.trend + wf + W.mom + W.vol + W.risk || 1;
+    const total = (W.trend * trend + wf * flow + W.mom * mom + W.vol * vol + W.risk * risk) / wsum;
 
     const res = {
-      total, parts,
+      total, parts, noFlow,
       metrics: { px, ma20, ma60, rsi, hist, ret1, ret5, ret20, flow5, flow20, foreign5: f5, inst5: i5, vr, vol20, dd, overext, streak, tv20 },
     };
     st._sc[key] = res;
@@ -329,7 +331,8 @@ const FD = (function () {
     const m = sc.metrics, out = [];
     if (m.px > m.ma20 && m.ma20 > m.ma60) out.push('정배열');
     else if (m.px < m.ma60) out.push('60일선 하회');
-    if (m.foreign5 > 0 && m.inst5 > 0) out.push('외인·기관 동반매수');
+    if (sc.noFlow) { /* 수급 데이터 없음 */ }
+    else if (m.foreign5 > 0 && m.inst5 > 0) out.push('외인·기관 동반매수');
     else if (m.flow5 < 0 && m.flow20 < 0) out.push('수급 이탈');
     else if (m.foreign5 > 0) out.push('외인 순매수');
     else if (m.inst5 > 0) out.push('기관 순매수');
@@ -344,22 +347,24 @@ const FD = (function () {
     const m = sc.metrics, cfg = o.cfg || DEF_CFG, held = !!o.held, p = o.pnlPct, reasons = [];
     const t = sc.total;
     const trendBroken = m.px < m.ma60 && m.ma20 < m.ma60;
-    const flowOut = m.flow5 < 0 && m.flow20 < 0;
+    const fk = !sc.noFlow;
+    const flowOut = fk && m.flow5 < 0 && m.flow20 < 0;
+    const weak = fk ? m.flow5 < 0 : m.ret5 < 0, strong = fk ? m.flow5 > 0 : true;
     let level = 'watch';
     if (held && p != null && p <= -cfg.stopLoss) {
       level = 'exit'; reasons.push(`평단 대비 ${p.toFixed(1)}%로 손절 기준(-${cfg.stopLoss}%)에 도달했습니다.`);
     } else if (trendBroken && flowOut) {
       level = 'exit'; reasons.push('60일선 아래에서 외국인·기관 수급이 20일·5일 모두 순매도입니다.');
-    } else if (t < 45 || (m.px < m.ma20 && m.hist < 0 && m.flow5 < 0) || (held && m.rsi > 78) ||
+    } else if (t < 45 || (m.px < m.ma20 && m.hist < 0 && weak) || (held && m.rsi > 78) ||
       (held && p != null && p >= cfg.takeProfit && m.rsi > 70)) {
       level = 'reduce';
       if (t < 45) reasons.push(`종합 매력도가 ${t.toFixed(0)}점으로 낮습니다.`);
-      if (m.px < m.ma20 && m.hist < 0 && m.flow5 < 0) reasons.push('20일선 이탈, MACD 약세, 최근 5일 수급 순매도가 겹쳤습니다.');
+      if (m.px < m.ma20 && m.hist < 0 && weak) reasons.push(fk ? '20일선 이탈, MACD 약세, 최근 5일 수급 순매도가 겹쳤습니다.' : '20일선 이탈, MACD 약세, 최근 5일 하락이 겹쳤습니다.');
       if (held && m.rsi > 78) reasons.push(`RSI ${m.rsi.toFixed(0)}로 단기 과열 구간입니다. 분할 익절을 검토하세요.`);
       if (held && p != null && p >= cfg.takeProfit && m.rsi > 70) reasons.push(`수익률 ${p.toFixed(1)}%로 익절 기준(+${cfg.takeProfit}%)을 넘었고 RSI가 높습니다.`);
-    } else if (t >= 68 && m.px > m.ma20 && m.rsi < 72 && m.flow5 > 0) {
+    } else if (t >= 68 && m.px > m.ma20 && m.rsi < 72 && strong) {
       level = 'buy';
-      reasons.push(`종합 ${t.toFixed(0)}점, 20일선 위 상승추세에 최근 5일 수급이 순매수입니다.`);
+      reasons.push(fk ? `종합 ${t.toFixed(0)}점, 20일선 위 상승추세에 최근 5일 수급이 순매수입니다.` : `종합 ${t.toFixed(0)}점, 20일선 위 상승추세입니다. (수급 데이터 없음)`);
     } else if (t >= 50) {
       level = 'hold';
       reasons.push(`종합 ${t.toFixed(0)}점으로 뚜렷한 매수·매도 신호는 없습니다.`);
@@ -611,7 +616,7 @@ const FD = (function () {
       const code = (c[col.code] || '').replace(/^A(?=\d{6}$)/, '').padStart(6, '0');
       if (!d || !c[col.code]) continue;
       const mk = col.market != null ? c[col.market].toUpperCase() : '';
-      const s = by[code] || (by[code] = { code, name: col.name != null ? c[col.name] : code, market: /KOSDAQ|코스닥|KSQ/.test(mk) ? 'KOSDAQ' : 'KOSPI', sector: col.sector != null ? c[col.sector] || '-' : '-', rows: [] });
+      const s = by[code] || (by[code] = { code, name: col.name != null ? c[col.name] : code, market: /ETF|ETN|상장지수/.test(mk) ? 'ETF' : /KOSDAQ|코스닥|KSQ/.test(mk) ? 'KOSDAQ' : 'KOSPI', sector: col.sector != null ? c[col.sector] || '-' : '-', rows: [] });
       s.rows.push([d, num(c[col.close]), num(c[col.volume]), col.foreign != null ? num(c[col.foreign]) / div : 0, col.inst != null ? num(c[col.inst]) / div : 0]);
     }
     const stocks = []; let skipped = 0;
@@ -619,7 +624,8 @@ const FD = (function () {
       const s = by[code]; s.rows.sort((a, b) => (a[0] < b[0] ? -1 : 1));
       const rows = s.rows.filter((r, i, a) => r[1] > 0 && (i === 0 || r[0] !== a[i - 1][0]));
       if (rows.length <= MIN_IDX + 5) { skipped++; continue; }
-      stocks.push({ code, name: s.name, market: s.market, sector: s.sector, d: rows.map((r) => r[0]), c: rows.map((r) => r[1]), v: rows.map((r) => r[2]), f: rows.map((r) => r[3]), i: rows.map((r) => r[4]) });
+      const nf = (col.foreign == null && col.inst == null) || !rows.some((r) => r[3] || r[4]);
+      stocks.push({ code, name: s.name, market: s.market, sector: s.sector, noFlow: nf, d: rows.map((r) => r[0]), c: rows.map((r) => r[1]), v: rows.map((r) => r[2]), f: rows.map((r) => r[3]), i: rows.map((r) => r[4]) });
     }
     if (!stocks.length) return { error: `종목당 최소 ${MIN_IDX + 6}거래일 이상의 데이터가 필요합니다.` };
     return { stocks, skipped };
