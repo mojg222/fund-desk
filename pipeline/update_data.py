@@ -128,7 +128,7 @@ def fetch_market(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.35, 
     log(f"market.csv 저장: {len(rows)}행, 종목 {len(names)}개, 순매수 단위는 원")
 
 
-def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=200):
+def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=5000):
     """대체 경로: FinanceDataReader (KRX 로그인 불필요). 수급(외국인/기관) 열은 비워 둡니다.
     앱은 수급 열이 없으면 수급 항목을 제외하고 나머지 4개 항목으로 점수를 계산합니다."""
     if fdr is None:
@@ -156,6 +156,8 @@ def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=
             seen.add(code)
             df = retry(lambda code=code: fdr.DataReader(code, start), tries=2, what=code)
             if df is None or len(df) < 71:
+                if mk == "ETF":
+                    log(f"[ETF 제외] {code} {r.get('Name', '')}: 가격 이력 {0 if df is None else len(df)}일 (71일 미만)")
                 continue
             df = df.tail(days)
             nm = str(r.get("Name", code))
@@ -282,7 +284,7 @@ def main(argv=None):
     ap.add_argument("--days", type=int, default=130, help="가져올 거래일 수 (점수 계산에 최소 70 필요)")
     ap.add_argument("--top-kospi", type=int, default=1000)
     ap.add_argument("--top-kosdaq", type=int, default=2000)
-    ap.add_argument("--top-etf", type=int, default=200)
+    ap.add_argument("--top-etf", type=int, default=5000)
     ap.add_argument("--pause", type=float, default=0.35, help="호출 간 대기(초)")
     ap.add_argument("--skip-market", action="store_true")
     ap.add_argument("--skip-macro", action="store_true")
