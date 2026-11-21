@@ -278,6 +278,80 @@ def fetch_macro(out_path, ecos_key=None):
     log(f"macro.json 저장: 지표 {len(series)}개, 기준일 {asof}")
 
 
+# ----------------------------------------------------------------------------
+# 3) 보유종목 뉴스 (Google News RSS, 제목·출처·날짜·링크만 저장)
+# ----------------------------------------------------------------------------
+def read_watchlist(path):
+    """data/watchlist.txt: 한 줄에 종목명 하나 (앞에 '코드 ' 를 붙여도 됨, # 은 주석)."""
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            t = line.split("#")[0].strip()
+            if not t:
+                continue
+            p = t.split(None, 1)
+            if len(p) == 2 and p[0].isdigit():
+                out.append((p[0].zfill(6), p[1].strip()))
+            else:
+                out.append(("", t))
+    return out
+
+
+def parse_news_rss(xml_text, limit=5):
+    import email.utils
+    import xml.etree.ElementTree as ET
+    items, seen = [], set()
+    root = ET.fromstring(xml_text)
+    for it in root.iter("item"):
+        title = (it.findtext("title") or "").strip()
+        link = (it.findtext("link") or "").strip()
+        src_el = it.find("source")
+        src = (src_el.text or "").strip() if src_el is not None else ""
+        if src and title.endswith(" - " + src):
+            title = title[: -len(src) - 3].strip()
+        if not title or not link.startswith("http") or title in seen:
+            continue
+        seen.add(title)
+        try:
+            d = email.utils.parsedate_to_datetime(it.findtext("pubDate")).astimezone(KST).strftime("%Y-%m-%d")
+        except Exception:  # noqa: BLE001
+            d = ""
+        items.append({"t": title, "u": link, "s": src, "d": d})
+        if len(items) >= limit:
+            break
+    return items
+
+
+def fetch_news(out_path, watch_path, per=5, pause=0.5, http=None):
+    import urllib.parse
+    http = http or http_get
+    wl = read_watchlist(watch_path)
+    if not wl:
+        log(f"  {watch_path} 가 없거나 비어 있어 뉴스를 건너뜁니다. (한 줄에 종목명 하나씩 적어 올리세요)")
+        return False
+    res, fail = {}, 0
+    for code, name in wl[:60]:
+        q = urllib.parse.quote(f'"{name}" when:14d')
+        url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+        try:
+            res[code or name] = {"name": name, "items": parse_news_rss(http(url), per)}
+        except Exception as e:  # noqa: BLE001
+            fail += 1
+            log(f"  [뉴스 실패] {name}: {e}")
+        time.sleep(pause)
+    if not res:
+        raise RuntimeError("뉴스를 한 건도 가져오지 못했습니다. 기존 파일을 유지합니다.")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"asof": dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "stocks": res}, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, out_path)
+    log(f"news.json 저장: {len(res)}종목 (실패 {fail})")
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
@@ -288,6 +362,7 @@ def main(argv=None):
     ap.add_argument("--pause", type=float, default=0.35, help="호출 간 대기(초)")
     ap.add_argument("--skip-market", action="store_true")
     ap.add_argument("--skip-macro", action="store_true")
+    ap.add_argument("--skip-news", action="store_true")
     a = ap.parse_args(argv)
     ok = 0
     if not a.skip_market:
@@ -311,6 +386,12 @@ def main(argv=None):
             ok += 1
         except Exception as e:  # noqa: BLE001
             log(f"[매크로 실패] {e}")
+    if not a.skip_news:
+        log("== 뉴스 ==")
+        try:
+            fetch_news(os.path.join(a.out, "news.json"), os.path.join(a.out, "watchlist.txt"))
+        except Exception as e:  # noqa: BLE001
+            log(f"[뉴스 실패] {e}")
     return 0 if ok else 1
 
 
