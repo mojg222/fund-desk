@@ -811,7 +811,66 @@ var _FD = FD;
   const EVENT_KINDS = { capex: 'CAPEX 완공', effect: '증설 효과 반영', earn: '실적 발표', disc: '공시·IR', agm: '주주총회', macro: '매크로', other: '기타' };
   function dDay(date, today) { const n = daysBetween(today, date); return { n, label: n === 0 ? 'D-Day' : n > 0 ? 'D-' + n : 'D+' + -n }; }
 
-  Object.assign(FD, { portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
+
+  /* ---------- 비중 제안 (리밸런싱 시뮬레이션) ----------
+     mode: score(동일비중+매력도 혼합) | risk(역변동성, 위험균형) | equal(동일비중)
+     신호 가중: 매수 1.2 · 보유 1 · 관망 0.8 · 비중축소 0.5 · 매도 0 → 정규화 → 종목 한도(maxWeight) 반복 적용 → 남은 몫은 현금 */
+  const SIG_MULT = { buy: 1.2, hold: 1, watch: 0.8, reduce: 0.5, exit: 0 };
+  function volAnn(st, t, L) {
+    const r = [];
+    for (let k = Math.max(1, t - L + 1); k <= t; k++) if (st.c[k - 1] > 0) r.push(st.c[k] / st.c[k - 1] - 1);
+    return r.length >= 20 ? sd(r) * Math.sqrt(252) : null;
+  }
+  function rebalance(an, date, o) {
+    o = o || {};
+    const mode = o.mode || 'score', cashT = clamp((o.cashPct == null ? 10 : o.cashPct) / 100, 0, 0.9), cap = clamp((o.maxWeight == null ? 25 : o.maxWeight) / 100, 0.02, 1), band = (o.band == null ? 2 : o.band) / 100;
+    const useSig = o.signals !== false, rows = an.rows.filter((r) => r.px != null && r.sc);
+    if (!rows.length || !an.totalAsset) return null;
+    const n = rows.length, invest = 1 - cashT;
+    let raw;
+    if (mode === 'equal') raw = rows.map(() => 1);
+    else if (mode === 'risk') {
+      const vs = rows.map((r) => volAnn(r.st, FD.idxOf(r.st, date), 60)), ok = vs.filter((v) => v), med = ok.length ? ok.slice().sort((a, b) => a - b)[Math.floor(ok.length / 2)] : 0.3;
+      raw = vs.map((v) => 1 / Math.max(0.05, v || med));
+    } else {
+      const ss = rows.reduce((s, r) => s + r.sc.total, 0) || 1;
+      const norm = raw0 => { const t = raw0.reduce((a, b) => a + b, 0) || 1; return raw0.map((x) => x / t); };
+      const a = norm(rows.map(() => 1)), b = norm(rows.map((r) => r.sc.total));
+      raw = a.map((x, i) => 0.5 * x + 0.5 * b[i]);
+      void ss;
+    }
+    const mult = rows.map((r) => (useSig && r.sig ? (SIG_MULT[r.sig.level] == null ? 1 : SIG_MULT[r.sig.level]) : 1));
+    let w = raw.map((x, i) => x * mult[i]);
+    const tot0 = w.reduce((a, b) => a + b, 0);
+    let tgt = new Array(n).fill(0);
+    if (tot0 > 0) {
+      w = w.map((x) => x / tot0);
+      const fixed = new Array(n).fill(false);
+      let room = invest;
+      for (let it = 0; it < 12; it++) {
+        const free = w.map((x, i) => (fixed[i] ? 0 : x)), fs = free.reduce((a, b) => a + b, 0);
+        if (fs <= 0) break;
+        let hit = false;
+        for (let i = 0; i < n; i++) if (!fixed[i] && (room * free[i]) / fs > cap + 1e-12) { fixed[i] = true; tgt[i] = cap; hit = true; }
+        const used = tgt.reduce((a, b, i) => a + (fixed[i] ? b : 0), 0), rest = invest - used, fs2 = w.reduce((a, x, i) => a + (fixed[i] ? 0 : x), 0);
+        room = rest;
+        if (!hit) { for (let i = 0; i < n; i++) if (!fixed[i]) tgt[i] = fs2 > 0 ? (rest * w[i]) / fs2 : 0; break; }
+        if (fixed.every(Boolean)) break;
+      }
+    }
+    const out = rows.map((r, i) => {
+      const cur = r.weight, diff = tgt[i] - cur, exit = useSig && r.sig && r.sig.level === 'exit';
+      let sh = Math.round((diff * an.totalAsset) / r.px);
+      if (exit) sh = -r.qty;
+      sh = Math.max(-r.qty, sh);
+      const act = exit && r.qty > 0 ? 'sell' : Math.abs(diff) < band || sh === 0 ? 'hold' : sh > 0 ? 'buy' : 'sell';
+      return { code: r.code, name: r.st ? r.st.name : r.code, cur, tgt: tgt[i], diff, shares: act === 'hold' ? 0 : sh, amount: act === 'hold' ? 0 : sh * r.px, act, level: r.sig ? r.sig.level : null, score: r.sc.total };
+    }).sort((a, b) => b.tgt - a.tgt);
+    const sumT = out.reduce((s, x) => s + x.tgt, 0), buy = out.reduce((s, x) => s + (x.amount > 0 ? x.amount : 0), 0), sell = out.reduce((s, x) => s + (x.amount < 0 ? -x.amount : 0), 0);
+    return { mode, cashCur: an.cashPct / 100, cashTgt: 1 - sumT, rows: out, buy, sell, turnover: Math.max(buy, sell) / an.totalAsset, totalAsset: an.totalAsset };
+  }
+
+  Object.assign(FD, { rebalance, portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
 })(_FD);
 
 
@@ -844,6 +903,7 @@ var _FD = FD;
   let UI = { tab: 'home', mk: 'KOSPI', rankDate: null, filter: 'all', sheet: null, tf: null, sub: { pf: 'hold', mk: 'rank', idea: 'ideas' }, ideaF: 'all', evShowDone: false, pick: {} };
   let M = { series: {}, asof: '', isSample: true };
   const EXT_ACT = {}, EXT_IN = {};
+  let NEWS = null;
   const stateJSON = () => JSON.stringify({ trades: S.trades, cash: S.cash, nextId: S.nextId, W: S.W, cfg: S.cfg, ideas: S.ideas, events: S.events });
   const slim = (s) => ({ code: s.code, name: s.name, market: s.market, sector: s.sector, d: s.d, c: s.c, v: s.v, f: s.f, i: s.i });
   const kv = {
@@ -922,6 +982,7 @@ var _FD = FD;
       const r = await Promise.race([fetch('data/macro.json', { cache: 'no-cache' }), to(12000)]);
       if (r && r.ok) { const p = FD_.parseMacro(await r.text()); if (p.macro && (!mc || p.macro.asof >= mc.asof)) { mc = p.macro; kv.set('macro', mc); } }
     } catch (e) { /* 파일 없음 */ }
+    try { const r = await Promise.race([fetch('data/news.json', { cache: 'no-cache' }), to(12000)]); if (r && r.ok) { const j = await r.json(); if (j && j.stocks) NEWS = j; } } catch (e) { /* 뉴스 없음 */ }
     if (mk) setData(mk, false); else setData(FD_.genSample(SAMPLE_END, 260), true);
     G.source = src;
     M = mc ? Object.assign({}, mc, { isSample: false }) : Object.assign({}, FD_.genMacroSample(SAMPLE_END), { isSample: true });
@@ -1034,6 +1095,8 @@ var _FD = FD;
     const as_ = allSugg(an), sg = as_.sg;
     h += riskCard(as_.rk);
     h += `<div class="sec-h"><h2>포트 운용 전략</h2><span>${G.asOf} 종가 기준</span></div><div class="card">${sg.length ? suggHTML(sg) : '<div class="empty">조정이 필요한 항목이 없습니다. 현재 구성을 유지하세요.</div>'}</div>`;
+    h += rebalCard(an);
+    h += newsCard(an);
     h += `<div class="sec-h"><h2>보유종목 ${an.rows.length}</h2><span>평가금액 순</span></div><div class="card list">${an.rows.map(rowHold).join('')}</div>`;
     return h;
   }
@@ -1302,6 +1365,58 @@ function riskCard(rk) {
     ${rk.rc.slice(0, 5).map((x) => `<div class="row" style="padding:4px 0;font-size:13px"><span style="width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</span><div class="bar sp"><i style="width:${Math.max(0, Math.min(100, x.rc * 100))}%;background:${x.rc > x.w * 1.3 ? 'var(--g-reduce)' : 'var(--accent)'}"></i></div><span class="num" style="width:92px;text-align:right">${(x.rc * 100).toFixed(0)}% <small class="mute">(비중 ${(x.w * 100).toFixed(0)}%)</small></span></div>`).join('')}
     <div class="hint">과거 120거래일 가격에 현재 비중을 적용한 역사적 시뮬레이션입니다. 미래 손실을 보장하지 않으며 시장 지수 대신 전종목 동일가중 평균을 사용했습니다.</div></div>`;
 }
+/* ---------- 비중 제안 ---------- */
+function rbState() {
+  if (!UI.rb) { const reg = FD_.macroRegime(M); UI.rb = { mode: 'score', cash: reg ? (reg.score < 40 ? 20 : reg.score >= 60 ? 5 : 10) : 10 }; }
+  return UI.rb;
+}
+function rebalCard(an) {
+  if (!an.rows.length) return '';
+  const o = rbState(), rb = FD_.rebalance(an, G.asOf, { mode: o.mode, cashPct: o.cash, maxWeight: S.cfg.maxWeight });
+  if (!rb) return '';
+  const MODES = [['score', '매력도형'], ['risk', '위험균형'], ['equal', '동일비중']];
+  const DESC = { score: '동일비중과 매력도 점수 비례를 반반 섞어, 점수가 높은 종목의 비중을 조금 더 줍니다.', risk: '변동성이 낮은 종목에 더 많은 비중을 줍니다(최근 60일 변동성의 역수). 종목별 위험을 비슷하게 맞추는 방식입니다.', equal: '보유종목을 같은 비중으로 맞춥니다. 가장 단순한 기준선입니다.' };
+  const reg = FD_.macroRegime(M), act = { buy: ['c-buy', '매수'], sell: ['c-sell', '매도'], hold: ['g-hold', '유지'] };
+  let h = `<div class="sec-h"><h2>비중 제안</h2><span>리밸런싱 시뮬레이션</span></div><div class="card">
+    <div class="seg" role="group" aria-label="비중 방식">${MODES.map(([k, l]) => `<button data-act="rb-mode" data-m="${k}" aria-pressed="${o.mode === k}">${l}</button>`).join('')}</div>
+    <div class="hint" style="margin-top:6px">${DESC[o.mode]} 매수 신호 종목은 1.2배, 비중 축소는 0.5배, 매도 신호는 0%로 반영하고 종목 한도 ${S.cfg.maxWeight}%를 넘지 않게 맞춥니다.</div>
+    <div class="row wrap" style="margin:10px 0 4px;gap:6px"><span class="ink2" style="font-size:13px">현금 목표</span>${[0, 5, 10, 20, 30].map((v) => `<button class="btn sm ${o.cash === v ? '' : 'ghost'}" data-act="rb-cash" data-v="${v}" aria-pressed="${o.cash === v}">${v}%</button>`).join('')}</div>
+    ${reg ? `<div class="hint">매크로 ${reg.label} (${reg.score.toFixed(0)}점) 구간의 참고 현금 비중은 ${reg.score < 40 ? 20 : reg.score >= 60 ? 5 : 10}%입니다.${M.isSample ? ' (샘플 지표 기준)' : ''}</div>` : ''}
+    <div class="row" style="padding:8px 0;border-top:1px solid var(--line);margin-top:8px;font-size:13px"><b style="flex:1">현금</b><span class="num ink2">${(rb.cashCur * 100).toFixed(1)}% → <b>${(rb.cashTgt * 100).toFixed(1)}%</b></span></div>`;
+  h += rb.rows.map((x) => {
+    const a = act[x.act], cw = Math.min(100, x.cur * 250), tw = Math.min(100, x.tgt * 250);
+    return `<button class="item" style="width:100%;border:0;border-top:1px solid var(--line);align-items:flex-start;text-align:left" data-act="stock" data-code="${x.code}" data-date="${G.asOf}"><div class="main" style="min-width:0">
+      <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</div>
+      <div class="num mute" style="font-size:12px">${(x.cur * 100).toFixed(1)}% → <b style="color:var(--ink)">${(x.tgt * 100).toFixed(1)}%</b> <span class="${cls(x.diff)}">(${sgn(x.diff * 100, 1)}%p)</span></div>
+      <div class="bar" style="margin-top:5px;height:4px;opacity:.45"><i style="width:${cw}%;background:var(--mute)"></i></div><div class="bar" style="margin-top:3px;height:4px"><i style="width:${tw}%;background:var(--accent)"></i></div></div>
+      <div style="text-align:right" class="num"><span class="chip ${a[0]}">${a[1]}${x.act === 'hold' ? '' : ' ' + fn(Math.abs(x.shares)) + '주'}</span><small style="display:block;margin-top:4px" class="${x.act === 'hold' ? 'mute' : cls(x.amount)}">${x.act === 'hold' ? '변경 불필요' : sgn(x.amount / 1e4, 0).replace(/(\d)(?=(\d{3})+$)/g, '$1,') + '만원'}</small></div></button>`;
+  }).join('');
+  h += `<div class="hint" style="margin-top:8px">예상 거래 규모: 매수 ${fwon(rb.buy)} · 매도 ${fwon(rb.sell)} (총자산의 ${(rb.turnover * 100).toFixed(0)}%). 2%p 미만 차이는 거래하지 않는 것으로 봅니다. 수수료·세금·호가 단위는 반영하지 않은 참고용 시뮬레이션이며, 보유종목만 대상으로 합니다.</div></div>`;
+  return h;
+}
+/* ---------- 보유종목 뉴스 ---------- */
+function newsOf(r) { if (!NEWS) return null; return NEWS.stocks[r.code] || NEWS.stocks[r.st.name] || null; }
+function newsCard(an) {
+  if (!an.rows.length) return '';
+  const have = [], miss = [];
+  an.rows.forEach((r) => { const n = newsOf(r); (n && n.items.length ? have : miss).push({ r, n }); });
+  let h = `<div class="sec-h"><h2>보유종목 뉴스</h2><span>${NEWS ? '갱신 ' + esc(NEWS.asof) : '미연결'}</span></div><div class="card">`;
+  if (!NEWS) h += '<div class="empty" style="padding:6px"><b>뉴스가 아직 연결되지 않았습니다</b>아래 버튼으로 종목 목록을 만들어 GitHub의 data/watchlist.txt로 올리면, 다음 자동 갱신부터 최근 2주 헤드라인이 표시됩니다.</div>';
+  have.forEach(({ r, n }) => {
+    h += `<div style="padding:8px 0;border-top:1px solid var(--line)"><div style="font-weight:600;margin-bottom:4px">${esc(r.st.name)}</div>${n.items.slice(0, 3).map((x) => `<a href="${esc(x.u)}" target="_blank" rel="noopener noreferrer" style="display:block;padding:4px 0;color:var(--ink);text-decoration:none;font-size:13px;line-height:1.4">${esc(x.t)}<small class="mute" style="display:block">${esc(x.s)}${x.s && x.d ? ' · ' : ''}${esc(x.d)}</small></a>`).join('')}</div>`;
+  });
+  if (NEWS && !have.length) h += '<div class="empty" style="padding:6px">보유종목의 최근 뉴스가 없거나, 아직 뉴스 대상 목록에 없습니다.</div>';
+  if (NEWS && have.length && miss.length) h += `<div class="hint" style="margin-top:6px">뉴스 없음: ${miss.map((m) => esc(m.r.st.name)).join(', ')}</div>`;
+  h += `<div class="row" style="margin-top:10px"><button class="btn sm soft" data-act="news-list">뉴스 대상 목록 만들기</button></div><div class="hint">검색 결과의 제목·출처·날짜만 보여 주며, 기사 원문은 눌러서 언론사 페이지에서 확인합니다. 투자 판단의 근거가 아니라 참고용입니다.</div></div>`;
+  return h;
+}
+function sheetNewsList(an) {
+  const txt = an.rows.map((r) => `${r.code} ${r.st.name}`).join('\n');
+  return `<div class="hd"><h2>뉴스 대상 목록</h2><button class="btn sm ghost" data-act="close">닫기</button></div>
+    <p class="ink2" style="margin:0;font-size:13px">아래 내용을 GitHub 저장소의 <b>data/watchlist.txt</b> 파일로 만드세요(Add file → Create new file → 이름에 data/watchlist.txt 입력 → 붙여넣기 → Commit). 보유종목이 바뀌면 다시 만들어 덮어쓰면 됩니다. 한 줄에 종목 하나, 최대 60개입니다.</p>
+    <textarea class="in" id="nw-text" readonly rows="${Math.min(12, Math.max(3, an.rows.length + 1))}" style="margin-top:10px">${esc(txt)}</textarea>
+    <button class="btn block" data-act="news-copy" style="margin-top:10px">복사하기</button>`;
+}
 function moreSugg(an, rk) {
   const out = [], reg = FD_.macroRegime(M), t = todayStr();
   if (rk && rk.rc.length > 1 && rk.rc[0].rc > 0.4 && rk.rc[0].rc > rk.rc[0].w * 1.3) out.push({ pri: 2.5, kind: 'warn', code: rk.rc[0].code, title: `${rk.rc[0].name} 위험 기여 ${(rk.rc[0].rc * 100).toFixed(0)}%`, body: `비중은 ${(rk.rc[0].w * 100).toFixed(0)}%인데 포트 변동성의 ${(rk.rc[0].rc * 100).toFixed(0)}%를 차지합니다. 변동성이 큰 종목이라 같은 비중보다 위험이 큽니다.` });
@@ -1506,6 +1621,10 @@ Object.assign(EXT_ACT, {
   'ev-del': (el, d) => { const e = S.events.find((x) => x.id === +d.id); S.events = S.events.filter((x) => x.id !== +d.id); store.save(); closeSheet(); if (e && e.ideaId) openSheet(sheetIdea(e.ideaId)); render(); toast('일정을 삭제했습니다.'); },
   'ev-done': (el, d) => { const e = S.events.find((x) => x.id === +d.id); if (!e) return; e.done = !e.done; store.save(); if ($('#sheet-wrap.on') && e.ideaId) { const y = $('.sheet').scrollTop; openSheet(sheetIdea(e.ideaId)); $('.sheet').scrollTop = y; } render(); },
   'ev-showdone': () => { UI.evShowDone = !UI.evShowDone; rerender(); },
+  'news-list': () => { const an = FD_.analyzePortfolio(S.trades, G.byCode, G.asOf, S.W, S.cfg, S.cash); openSheet(sheetNewsList(an)); },
+  'news-copy': () => { const el = $('#nw-text'); el.focus(); el.select(); let ok = false; try { ok = document.execCommand('copy'); } catch (e) { /* 직접 복사 */ } if (navigator.clipboard) navigator.clipboard.writeText(el.value).then(() => toast('복사했습니다.'), () => {}); else toast(ok ? '복사했습니다.' : '글을 길게 눌러 복사하세요.'); },
+  'rb-mode': (el, d) => { rbState().mode = d.m; rerender(); },
+  'rb-cash': (el, d) => { rbState().cash = +d.v; rerender(); },
   'sq-pick': (el, d) => { UI.pick[d.p] = d.code; const st = G.byCode[d.code]; $('#' + d.p + '-q').value = `${st.name} (${st.code})`; $('#' + d.p + '-res').innerHTML = ''; },
   'macro-import': () => openSheet(sheetMacroImport()),
   'macro-run': () => { const t = $('#mc-text').value.trim(); if (!t) { $('#mc-err').textContent = 'JSON을 붙여넣거나 파일을 선택하세요.'; return; } const r = FD_.parseMacro(t); if (r.error) { $('#mc-err').textContent = r.error; return; } M = Object.assign({}, r.macro, { isSample: false }); kv.set('macro', r.macro); closeSheet(); UI.tab = 'mk'; UI.sub.mk = 'macro'; render(); toast(`지표 ${Object.keys(r.macro.series).length}개를 불러왔습니다.`); },
