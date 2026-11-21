@@ -128,16 +128,19 @@ def fetch_market(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.35, 
     log(f"market.csv 저장: {len(rows)}행, 종목 {len(names)}개, 순매수 단위는 원")
 
 
-def fetch_market_fdr(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.15, fdr=None):
+def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=200):
     """대체 경로: FinanceDataReader (KRX 로그인 불필요). 수급(외국인/기관) 열은 비워 둡니다.
     앱은 수급 열이 없으면 수급 항목을 제외하고 나머지 4개 항목으로 점수를 계산합니다."""
     if fdr is None:
         import FinanceDataReader as fdr  # noqa: PLC0415
     today = dt.datetime.now(KST).date()
     start = (today - dt.timedelta(days=int(days * 1.7) + 10)).strftime("%Y-%m-%d")
-    rows, names = [], 0
-    for mk, topn in (("KOSPI", top_kospi), ("KOSDAQ", top_kosdaq)):
-        lst = retry(lambda mk=mk: fdr.StockListing(mk), what=f"{mk} 종목 목록")
+    rows, names, seen = [], 0, set()
+    plan = [("KOSPI", top_kospi, "KOSPI"), ("KOSDAQ", top_kosdaq, "KOSDAQ")]
+    if top_etf > 0:
+        plan.append(("ETF", top_etf, "ETF/KR"))
+    for mk, topn, listing in plan:
+        lst = retry(lambda listing=listing: fdr.StockListing(listing), what=f"{mk} 종목 목록")
         if lst is None or len(lst) == 0:
             raise RuntimeError(f"{mk} 종목 목록을 가져오지 못했습니다.")
         key = "Amount" if "Amount" in lst.columns else ("Marcap" if "Marcap" in lst.columns else None)
@@ -145,14 +148,18 @@ def fetch_market_fdr(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.
             lst = lst.sort_values(key, ascending=False)
         lst = lst.head(topn)
         sec_col = "Sector" if "Sector" in lst.columns else None
+        code_col = "Code" if "Code" in lst.columns else "Symbol"
         for _, r in lst.iterrows():
-            code = str(r["Code"]).zfill(6)
+            code = str(r[code_col]).zfill(6)
+            if code in seen:
+                continue
+            seen.add(code)
             df = retry(lambda code=code: fdr.DataReader(code, start), tries=2, what=code)
             if df is None or len(df) < 71:
                 continue
             df = df.tail(days)
             nm = str(r.get("Name", code))
-            sec = str(r[sec_col]) if sec_col and r[sec_col] == r[sec_col] else "-"
+            sec = str(r[sec_col]) if sec_col and r[sec_col] == r[sec_col] else ("ETF" if mk == "ETF" else "-")
             for idx, x in df.iterrows():
                 if float(x["Close"]) <= 0:
                     continue
@@ -273,8 +280,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
     ap.add_argument("--days", type=int, default=130, help="가져올 거래일 수 (점수 계산에 최소 70 필요)")
-    ap.add_argument("--top-kospi", type=int, default=250)
-    ap.add_argument("--top-kosdaq", type=int, default=350)
+    ap.add_argument("--top-kospi", type=int, default=1000)
+    ap.add_argument("--top-kosdaq", type=int, default=2000)
+    ap.add_argument("--top-etf", type=int, default=200)
     ap.add_argument("--pause", type=float, default=0.35, help="호출 간 대기(초)")
     ap.add_argument("--skip-market", action="store_true")
     ap.add_argument("--skip-macro", action="store_true")
@@ -290,7 +298,7 @@ def main(argv=None):
             log(f"[KRX(pykrx) 실패] {e}")
             log("→ 대체 경로(FinanceDataReader, 수급 없이 가격만)로 다시 시도합니다.")
             try:
-                fetch_market_fdr(out, a.days, a.top_kospi, a.top_kosdaq)
+                fetch_market_fdr(out, a.days, a.top_kospi, a.top_kosdaq, top_etf=a.top_etf)
                 ok += 1
             except Exception as e2:  # noqa: BLE001
                 log(f"[시장 데이터 실패] {e2}")
