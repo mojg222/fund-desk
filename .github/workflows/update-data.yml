@@ -21,6 +21,7 @@ jobs:
           KRX_PW: ${{ secrets.KRX_PW }}
           NAVER_HUB_ID: ${{ secrets.NAVER_HUB_ID }}
           NAVER_HUB_SECRET: ${{ secrets.NAVER_HUB_SECRET }}
+          DART_KEY: ${{ secrets.DART_KEY }}
       - run: |
           git config user.name "data-bot"
           git config user.email "data-bot@users.noreply.github.com"
