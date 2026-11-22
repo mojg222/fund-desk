@@ -29,8 +29,10 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
-def http_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (fund-desk)"})
+def http_get(url, headers=None):
+    h = {"User-Agent": "Mozilla/5.0 (fund-desk)"}
+    h.update(headers or {})
+    req = urllib.request.Request(url, headers=h)
     with urllib.request.urlopen(req, timeout=40) as r:
         return r.read().decode("utf-8", "replace")
 
@@ -324,15 +326,64 @@ def parse_news_rss(xml_text, limit=5):
     return items
 
 
-def fetch_news(out_path, watch_path, per=5, pause=0.5, http=None):
+def clean_html(t):
+    import html
+    import re
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", "", t or ""))).strip()
+
+
+def naver_hub_news(name, cid, secret, http, per=5):
+    """NAVER API HUB 뉴스 검색: 제목·요약(description)·원문 링크·발행시각. 최근순 30건 중 종목명이 들어간 최신 기사."""
+    import email.utils
+    import urllib.parse
+    url = "https://naverapihub.apigw.ntruss.com/search/v1/news?" + urllib.parse.urlencode({"query": name, "display": 30, "start": 1, "sort": "date", "format": "json"})
+    data = json.loads(http(url, headers={"X-NCP-APIGW-API-KEY-ID": cid, "X-NCP-APIGW-API-KEY": secret}))
+    today = dt.datetime.now(KST).date()
+    keyn = name.replace(" ", "").lower()
+    items, seen, n7 = [], set(), 0
+    for it in data.get("items", []):
+        title, desc = clean_html(it.get("title")), clean_html(it.get("description"))
+        if not title or title in seen:
+            continue
+        if keyn not in (title + desc).replace(" ", "").lower():
+            continue
+        seen.add(title)
+        try:
+            d = email.utils.parsedate_to_datetime(it.get("pubDate")).astimezone(KST).date()
+        except Exception:  # noqa: BLE001
+            d = None
+        if d and (today - d).days <= 7:
+            n7 += 1
+        link = it.get("link") or it.get("originallink") or ""
+        if not link.startswith("http"):
+            continue
+        src = urllib.parse.urlparse(it.get("originallink") or link).netloc.replace("www.", "")
+        items.append({"t": title, "u": link, "s": src, "d": d.strftime("%Y-%m-%d") if d else "", "m": desc[:140]})
+    return {"items": items[:per], "n7": n7}
+
+
+def fetch_news(out_path, watch_path, per=5, pause=0.5, http=None, hub=None):
     import urllib.parse
     http = http or http_get
+    if hub is None:
+        cid, sec = os.environ.get("NAVER_HUB_ID"), os.environ.get("NAVER_HUB_SECRET")
+        hub = (cid, sec) if cid and sec else None
+    log("  뉴스 출처: " + ("NAVER API HUB (실패 시 Google News로 대체)" if hub else "Google News RSS (NAVER_HUB_ID/SECRET 없음)"))
     wl = read_watchlist(watch_path)
     if not wl:
         log(f"  {watch_path} 가 없거나 비어 있어 뉴스를 건너뜁니다. (한 줄에 종목명 하나씩 적어 올리세요)")
         return False
     res, fail = {}, 0
     for code, name in wl[:60]:
+        if hub:
+            try:
+                r = naver_hub_news(name, hub[0], hub[1], http, per)
+                if r["items"]:
+                    res[code or name] = {"name": name, "src": "naver", **r}
+                    time.sleep(pause)
+                    continue
+            except Exception as e:  # noqa: BLE001
+                log(f"  [NAVER 실패→Google] {name}: {type(e).__name__} {str(e)[:80]}")
         q = urllib.parse.quote(f'"{name}" when:14d')
         url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
         try:
