@@ -29,6 +29,12 @@ def log(*a):
     print(*a, file=sys.stderr, flush=True)
 
 
+def http_bytes(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (fund-desk)"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read()
+
+
 def http_get(url, headers=None):
     h = {"User-Agent": "Mozilla/5.0 (fund-desk)"}
     h.update(headers or {})
@@ -403,6 +409,105 @@ def fetch_news(out_path, watch_path, per=5, pause=0.5, http=None, hub=None):
     return True
 
 
+# ----------------------------------------------------------------------------
+# 4) 주요 공시 (OpenDART: 고유번호 목록 → 종목코드 연결 → 공시검색)
+# ----------------------------------------------------------------------------
+DART_API = "https://opendart.fss.or.kr/api"
+# 보고서명에 들어 있는 말로 공시 성격을 분류 (앞에서부터 먼저 맞는 것)
+DART_KINDS = [
+    ("risk", "위험", ("상장폐지", "관리종목", "횡령", "배임", "감사의견", "불성실공시", "거래정지", "회생", "파산", "부도", "소송", "투자주의")),
+    ("fund", "자금조달", ("유상증자", "전환사채", "교환사채", "신주인수권", "감자", "무상증자")),
+    ("back", "주주환원", ("자기주식", "배당", "주식소각")),
+    ("earn", "실적", ("영업(잠정)실적", "잠정실적", "실적", "손익구조")),
+    ("deal", "계약·투자", ("단일판매", "공급계약", "시설투자", "신규시설", "타법인주식", "유형자산")),
+    ("mna", "지배구조", ("합병", "분할", "영업양수", "영업양도", "최대주주", "주식교환", "공개매수", "경영권")),
+    ("rep", "정기보고서", ("사업보고서", "분기보고서", "반기보고서")),
+]
+
+
+def dart_kind(name):
+    for k, label, words in DART_KINDS:
+        if any(w in name for w in words):
+            return k, label
+    return "etc", "공시"
+
+
+def dart_corp_map(key, get_bytes):
+    """corpCode.xml(ZIP) → ({종목코드: 고유번호}, {회사명: (고유번호, 종목코드)}) — 상장사만."""
+    import io
+    import xml.etree.ElementTree as ET
+    import zipfile
+    raw = get_bytes(f"{DART_API}/corpCode.xml?crtfc_key={key}")
+    try:
+        z = zipfile.ZipFile(io.BytesIO(raw))
+    except zipfile.BadZipFile:
+        raise RuntimeError("고유번호 파일을 받지 못했습니다(키 오류·한도 초과 가능): " + raw[:120].decode("utf-8", "replace").replace(key, "***"))
+    by_code, by_name = {}, {}
+    for el in ET.fromstring(z.read("CORPCODE.xml")).iter("list"):
+        sc = (el.findtext("stock_code") or "").strip()
+        cc = (el.findtext("corp_code") or "").strip()
+        if not sc or not cc:
+            continue
+        by_code[sc] = cc
+        by_name.setdefault((el.findtext("corp_name") or "").strip(), (cc, sc))
+    return by_code, by_name
+
+
+def fetch_dart(out_path, watch_path, key, days=30, per=5, pause=0.2, get_bytes=None, get_text=None):
+    import urllib.parse
+    get_bytes = get_bytes or http_bytes
+    get_text = get_text or http_get
+    wl = read_watchlist(watch_path)
+    if not wl:
+        log(f"  {watch_path} 가 없거나 비어 있어 공시를 건너뜁니다.")
+        return False
+    by_code, by_name = dart_corp_map(key, get_bytes)
+    log(f"  상장사 고유번호 {len(by_code)}건 확인")
+    today = dt.datetime.now(KST).date()
+    bgn, end = (today - dt.timedelta(days=days)).strftime("%Y%m%d"), today.strftime("%Y%m%d")
+    res, skipped = {}, []
+    for code, name in wl[:60]:
+        cc, sc = by_code.get(code), code
+        if not cc and name in by_name:
+            cc, sc = by_name[name]
+        if not cc:
+            skipped.append(name)  # ETF·비상장은 공시 대상이 아님
+            continue
+        q = urllib.parse.urlencode({"crtfc_key": key, "corp_code": cc, "bgn_de": bgn, "end_de": end, "page_count": 30})
+        data = json.loads(get_text(f"{DART_API}/list.json?{q}"))
+        st = data.get("status")
+        if st == "013":
+            res[sc] = {"name": name, "items": []}
+        elif st != "000":
+            raise RuntimeError(f"DART 오류 {st}: {data.get('message', '')}")
+        else:
+            items = []
+            for it in data.get("list", []):
+                nm = (it.get("report_nm") or "").strip()
+                if not nm or not it.get("rcept_no"):
+                    continue
+                k, label = dart_kind(nm)
+                d = it.get("rcept_dt") or ""
+                items.append({"t": nm, "u": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={it['rcept_no']}", "d": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d, "k": k, "l": label, "f": (it.get("flr_nm") or "").strip()})
+            # 정기보고서·기타보다 중요한 공시를 앞에, 같은 중요도면 최신순
+            order = {"risk": 0, "fund": 1, "back": 2, "earn": 2, "deal": 2, "mna": 2, "etc": 3, "rep": 4}
+            items.sort(key=lambda x: x["d"], reverse=True)
+            items.sort(key=lambda x: order.get(x["k"], 3))
+            res[sc] = {"name": name, "items": items[:per], "n": len(items)}
+        time.sleep(pause)
+    if skipped:
+        log(f"  공시 대상이 아니어서 건너뜀(ETF·비상장 등): {', '.join(skipped[:10])}{' …' if len(skipped) > 10 else ''}")
+    if not res:
+        raise RuntimeError("공시를 조회할 상장사가 하나도 없습니다.")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"asof": dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "days": days, "stocks": res}, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, out_path)
+    log(f"dart.json 저장: {len(res)}종목")
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
@@ -414,6 +519,7 @@ def main(argv=None):
     ap.add_argument("--skip-market", action="store_true")
     ap.add_argument("--skip-macro", action="store_true")
     ap.add_argument("--skip-news", action="store_true")
+    ap.add_argument("--skip-dart", action="store_true")
     a = ap.parse_args(argv)
     ok = 0
     if not a.skip_market:
@@ -443,6 +549,16 @@ def main(argv=None):
             fetch_news(os.path.join(a.out, "news.json"), os.path.join(a.out, "watchlist.txt"))
         except Exception as e:  # noqa: BLE001
             log(f"[뉴스 실패] {e}")
+    if not a.skip_dart:
+        log("== 공시 ==")
+        dkey = os.environ.get("DART_KEY")
+        if not dkey:
+            log("  DART_KEY가 없어 공시를 건너뜁니다.")
+        else:
+            try:
+                fetch_dart(os.path.join(a.out, "dart.json"), os.path.join(a.out, "watchlist.txt"), dkey)
+            except Exception as e:  # noqa: BLE001
+                log(f"[공시 실패] {str(e).replace(dkey, '***')}")
     return 0 if ok else 1
 
 
