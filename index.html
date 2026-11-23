@@ -196,6 +196,12 @@ select.in{appearance:auto}
 /* 운용데스크 core: 지표, 매력도 점수, 신호, 포트폴리오 계산, 샘플 데이터, CSV 파서 (DOM 의존 없음) */
 const FD = (function () {
   const DEF_W = { trend: 30, flow: 30, mom: 20, vol: 10, risk: 10 };
+  const VAL_SHARE = 0.5; // 가치/안전성 지표에서 밸류에이션이 차지하는 비중
+  /* 매력도 가중치 프리셋 (합계 100). 중장기형은 가치/안전성을 크게, 단기형은 추세·수급·모멘텀을 크게 */
+  const PROFILES = {
+    short: { label: '단기형', desc: '며칠~몇 주 단위 매매. 추세·수급·모멘텀을 크게 보고 가치/안전성은 낮게 반영합니다.', W: { trend: 30, flow: 30, mom: 25, vol: 10, risk: 5 } },
+    long: { label: '중장기형', desc: '수개월~1년 이상 보유. 밸류에이션과 변동성·낙폭을 합친 가치/안전성을 가장 크게 보고 추세·수급 비중은 낮춥니다.', W: { trend: 25, flow: 15, mom: 10, vol: 5, risk: 45 } },
+  };
   const DEF_CFG = { maxWeight: 25, stopLoss: 8, takeProfit: 25, minTV: 10 };
   const MIN_IDX = 65; // 60일선·MACD 안정화에 필요한 최소 봉 수
 
@@ -255,7 +261,7 @@ const FD = (function () {
   }
 
   /* ---------- 매력도 점수 ---------- */
-  function wKey(W) { return [W.trend, W.flow, W.mom, W.vol, W.risk, W.val == null ? 15 : W.val].join(','); }
+  function wKey(W) { return [W.trend, W.flow, W.mom, W.vol, W.risk].join(','); }
 
   /* 밸류에이션(OpenDART 재무 + 시가총액으로 자동 계산한 PER·PBR·ROE) → 0~100점. per/pbr이 0 이하면 적자·자본잠식. 높을수록 저평가.
      PER은 낮을수록, PBR은 낮을수록 좋고, ROE가 있으면 PBR을 'ROE÷10 대비 PBR'(적정 PBR 대비)로 보정. 입력된 항목의 평균 */
@@ -341,18 +347,16 @@ const FD = (function () {
     const vs = scale(vr, 0.7, 1.8);
     const vol = ret5 > 0 ? vs : 60 - vs * 0.6;
 
-    // 5) 리스크
-    const risk = 0.4 * (100 - scale(vol20, 1, 4)) + 0.3 * scale(dd, -0.25, 0) + 0.3 * (100 - scale(overext, 0.06, 0.2));
+    // 5) 가치/안전성: 변동성·낙폭·과열(안전성)에 밸류에이션 점수(OpenDART 자동)를 절반씩 결합. 밸류에이션 자료가 없는 종목은 안전성만 사용
+    const safe = 0.4 * (100 - scale(vol20, 1, 4)) + 0.3 * scale(dd, -0.25, 0) + 0.3 * (100 - scale(overext, 0.06, 0.2));
+    const val = st.val ? valScore(st.val) : null;
+    const risk = val == null ? safe : safe * (1 - VAL_SHARE) + val * VAL_SHARE;
 
-    const parts = { trend, mom, flow, vol, risk };
+    const parts = { trend, mom, flow, vol, risk, safe };
+    if (val != null) parts.val = val;
     const wf = noFlow ? 0 : W.flow;
     const wsum = W.trend + wf + W.mom + W.vol + W.risk || 1;
-    let total = (W.trend * trend + wf * flow + W.mom * mom + W.vol * vol + W.risk * risk) / wsum;
-    let val = null;
-    if (st.val) { // 밸류에이션 자료가 있는 종목만: 독립 지표로 한 번 더 가중 평균
-      val = valScore(st.val);
-      if (val != null) { parts.val = val; const wv = clamp((W.val == null ? 15 : W.val) / 100, 0, 1); total = total * (1 - wv) + val * wv; }
-    }
+    const total = (W.trend * trend + wf * flow + W.mom * mom + W.vol * vol + W.risk * risk) / wsum;
 
     const res = {
       total, parts, noFlow, val, valIn: st.val || null,
@@ -668,7 +672,7 @@ const FD = (function () {
     return { stocks, skipped };
   }
 
-  return { valScore, searchStocks, DEF_W, DEF_CFG, MIN_IDX, scoreAt, signal, tags, rankAt, marketStats, computePositions, analyzePortfolio, suggestions, genSample, parseMarketCSV, idxOf, getInd, tradingDates };
+  return { PROFILES, VAL_SHARE, valScore, searchStocks, DEF_W, DEF_CFG, MIN_IDX, scoreAt, signal, tags, rankAt, marketStats, computePositions, analyzePortfolio, suggestions, genSample, parseMarketCSV, idxOf, getInd, tradingDates };
 })();
 
 
@@ -977,12 +981,12 @@ var _FD = FD;
   /* ---------- 상태 ---------- */
   const SAMPLE_END = '2026-11-20';
   let G = { stocks: [], byCode: {}, dates: [], rankDates: [], asOf: '', isSample: true };
-  let S = { trades: [], cash: 0, nextId: 1, W: Object.assign({}, FD_.DEF_W), cfg: Object.assign({}, FD_.DEF_CFG), ideas: [], events: [], watch: [] };
+  let S = { trades: [], cash: 0, nextId: 1, W: Object.assign({}, FD_.DEF_W), cfg: Object.assign({}, FD_.DEF_CFG), ideas: [], events: [], watch: [], profile: 'default', customW: null };
   let UI = { tab: 'home', mk: 'KOSPI', rankDate: null, filter: 'all', sheet: null, tf: null, sub: { pf: 'hold', mk: 'rank', idea: 'ideas' }, ideaF: 'all', evShowDone: false, pick: {} };
   let M = { series: {}, asof: '', isSample: true };
   const EXT_ACT = {}, EXT_IN = {};
-  let NEWS = null, DART = null, VAL = null;
-  const stateJSON = () => JSON.stringify({ trades: S.trades, cash: S.cash, nextId: S.nextId, W: S.W, cfg: S.cfg, ideas: S.ideas, events: S.events, watch: S.watch });
+  let NEWS = null, DART = null, VAL = null, EVT = null;
+  const stateJSON = () => JSON.stringify({ trades: S.trades, cash: S.cash, nextId: S.nextId, W: S.W, cfg: S.cfg, ideas: S.ideas, events: S.events, watch: S.watch, profile: S.profile, customW: S.customW });
   const slim = (s) => ({ code: s.code, name: s.name, market: s.market, sector: s.sector, d: s.d, c: s.c, v: s.v, f: s.f, i: s.i });
   const kv = {
     _db: null,
@@ -993,6 +997,8 @@ var _FD = FD;
     async del(k) { try { await this._tx('readwrite', (st) => st.delete(k)); } catch (e) { /* 무시 */ } try { localStorage.removeItem('fd_' + k); } catch (e) { /* 무시 */ } },
   };
 
+  const sameW = (a, b) => Object.keys(FD_.DEF_W).every((k) => +a[k] === +b[k]);
+  function detectProfile() { return sameW(S.W, FD_.DEF_W) ? 'default' : sameW(S.W, FD_.PROFILES.short.W) ? 'short' : sameW(S.W, FD_.PROFILES.long.W) ? 'long' : 'custom'; }
   function applyVal() { if (G.stocks) G.stocks.forEach((s) => { const v = VAL && VAL.stocks[s.code]; s.val = v ? { per: v[0], pbr: v[1], roe: v[2], fy: v[3] } : null; }); }
   function setData(stocks, isSample) {
     G.stocks = stocks; G.isSample = isSample; G.byCode = {};
@@ -1047,6 +1053,8 @@ var _FD = FD;
     S.cash = +d.cash || 0;
     S.nextId = Math.max(+d.nextId || 1, S.trades.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1, S.ideas.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1, S.events.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1);
     if (d.W) S.W = Object.assign({}, FD_.DEF_W, d.W);
+    S.customW = d.customW && typeof d.customW === 'object' ? Object.assign({}, FD_.DEF_W, d.customW) : null;
+    S.profile = ['short', 'long', 'custom', 'default'].includes(d.profile) ? d.profile : detectProfile();
     if (d.cfg) S.cfg = Object.assign({}, FD_.DEF_CFG, d.cfg);
   }
   async function loadData() {
@@ -1064,6 +1072,7 @@ var _FD = FD;
       if (r && r.ok) { const p = FD_.parseMacro(await r.text()); if (p.macro && (!mc || p.macro.asof >= mc.asof)) { mc = p.macro; kv.set('macro', mc); } }
     } catch (e) { /* 파일 없음 */ }
     try { const r = await Promise.race([fetch('data/valuation.json', { cache: 'no-cache' }), to(20000)]); if (r && r.ok) { const j = await r.json(); if (j && j.stocks) VAL = j; } } catch (e) { /* 밸류에이션 자료 없음 */ }
+    try { const r = await Promise.race([fetch('data/events.json', { cache: 'no-cache' }), to(15000)]); if (r && r.ok) { const j = await r.json(); if (j && Array.isArray(j.items)) EVT = j; } } catch (e) { /* 이벤트 없음 */ }
     try { const r = await Promise.race([fetch('data/dart.json', { cache: 'no-cache' }), to(12000)]); if (r && r.ok) { const j = await r.json(); if (j && j.stocks) DART = j; } } catch (e) { /* 공시 없음 */ }
     try { const r = await Promise.race([fetch('data/news.json', { cache: 'no-cache' }), to(12000)]); if (r && r.ok) { const j = await r.json(); if (j && j.stocks) NEWS = j; } } catch (e) { /* 뉴스 없음 */ }
     if (mk) setData(mk, false); else setData(FD_.genSample(SAMPLE_END, 260), true);
@@ -1076,7 +1085,7 @@ var _FD = FD;
   const chipSig = (sg) => `<span class="chip g-${sg.level}"><span aria-hidden="true">${ICON[sg.level]}</span>${esc(sg.label)}</span>`;
   const ring = (v, sz) => `<div class="ring" style="--p:${v.toFixed(0)};--rc:${v >= 70 ? 'var(--s-hi)' : v >= 50 ? 'var(--s-mid)' : 'var(--s-lo)'};--sz:${sz || 44}px" role="img" aria-label="매력도 ${v.toFixed(0)}점"><span>${v.toFixed(0)}</span></div>`;
   const heldQty = () => { const { pos } = FD_.computePositions(S.trades); return pos; };
-  const PART = [['trend', '추세'], ['flow', '수급'], ['mom', '모멘텀'], ['vol', '거래량'], ['risk', '안정성']];
+  const PART = [['trend', '추세'], ['flow', '수급'], ['mom', '모멘텀'], ['vol', '거래량'], ['risk', '가치/안전성']];
   let toastT;
   function toast(msg) {
     let el = $('.toast'); if (!el) { el = document.createElement('div'); el.className = 'toast'; el.setAttribute('role', 'status'); document.body.appendChild(el); }
@@ -1194,7 +1203,7 @@ var _FD = FD;
         <button class="iconbtn" data-act="rdate" data-dir="1" aria-label="다음 거래일" ${i >= G.rankDates.length - 1 ? 'disabled' : ''}>▶</button></div>`;
     h += `<div class="card list">${rk.length ? rk.map((o) => rowRank(o, held[o.st.code] && held[o.st.code].qty > 0, d)).join('') : '<div class="empty">이 날짜에 평가할 종목이 없습니다. 거래대금 하한(설정)을 낮춰 보세요.</div>'}</div>
       <div class="row"><button class="btn soft" data-act="copy-rank">TOP10 리포트 복사</button><span class="hint">순위 변동은 직전 거래일 대비</span></div>
-      <p class="foot">매력도 = 추세 ${S.W.trend} · 수급 ${S.W.flow} · 모멘텀 ${S.W.mom} · 거래량 ${S.W.vol} · 안정성 ${S.W.risk} 가중 평균(0~100점). 종가·외국인·기관 수급만 사용하며 해당 일자까지의 데이터로 계산합니다. 평균 거래대금 ${S.cfg.minTV}억원 미만 종목은 제외됩니다.</p>`;
+      <p class="foot">매력도 = 추세 ${S.W.trend} · 수급 ${S.W.flow} · 모멘텀 ${S.W.mom} · 거래량 ${S.W.vol} · 가치/안전성 ${S.W.risk} 가중 평균(0~100점). 종가·외국인·기관 수급만 사용하며 해당 일자까지의 데이터로 계산합니다. 평균 거래대금 ${S.cfg.minTV}억원 미만 종목은 제외됩니다.</p>`;
     return h;
   }
 
@@ -1236,8 +1245,11 @@ var _FD = FD;
       <div class="hint">${G.source === 'auto' ? '자동 갱신 파일(data/market.csv)에서 불러왔습니다.' : G.source === 'saved' ? '이 기기에 저장된 데이터를 사용 중입니다.' : '호스팅 폴더에 data/market.csv가 있으면 실행할 때마다 자동으로 불러옵니다.'}</div></div>
       <div class="card"><h2>매크로 지표<small>${M.isSample ? '샘플(가상) 지표' : '기준일 ' + (M.asof || '')}</small></h2><p class="ink2" style="margin:0 0 10px;font-size:13px">금리, 환율, 물가 시계열(macro.json)을 불러옵니다. data/macro.json이 있으면 자동으로 읽습니다.</p><div class="row wrap"><button class="btn" data-act="macro-import">macro.json 가져오기</button>${M.isSample ? '' : '<button class="btn ghost" data-act="macro-sample">샘플로 되돌리기</button>'}</div></div>
       <div class="card"><h2>매력도 가중치<small>합계 ${wsum} → 비율로 환산</small></h2>
+      <div class="seg" role="group" aria-label="가중치 유형">${[['short', FD_.PROFILES.short.label], ['long', FD_.PROFILES.long.label], ['custom', '내 설정']].map(([k, l]) => `<button data-act="w-prof" data-p="${k}" aria-pressed="${S.profile === k}">${l}</button>`).join('')}</div>
+      <div class="hint" style="margin:6px 0 8px">${S.profile === 'short' ? esc(FD_.PROFILES.short.desc) : S.profile === 'long' ? esc(FD_.PROFILES.long.desc) : S.profile === 'custom' ? '직접 조정한 비율입니다. 아래 슬라이더를 움직이면 이 기기에 자동 저장되고, 단기형·중장기형으로 바꿨다가 "내 설정"을 누르면 다시 불러옵니다.' : '기본 균형형입니다. 단기형·중장기형을 고르거나 아래에서 직접 조정할 수 있습니다.'}</div>
       ${PART.map(([k, l]) => sl('w-' + k, l, S.W[k], 0, 50, 5, '')).join('')}
       <div class="hint">현재 비율: ${PART.map(([k, l]) => `${l} ${((S.W[k] / wsum) * 100).toFixed(0)}%`).join(' · ')}</div>
+      <div class="hint">가치/안전성은 변동성·낙폭·과열(안전성)과 밸류에이션(PER·PBR·ROE)을 절반씩 합친 지표입니다. 밸류에이션 자료가 없는 종목은 안전성만 반영합니다.</div>
       <button class="btn sm ghost" style="margin-top:8px" data-act="w-reset">기본값으로</button></div>
       <div class="card"><h2>운용 규칙</h2>
       ${sl('c-maxWeight', '종목 한도', S.cfg.maxWeight, 10, 60, 5, '%')}${sl('c-stopLoss', '손절 기준', S.cfg.stopLoss, 3, 20, 1, '%')}${sl('c-takeProfit', '익절 기준', S.cfg.takeProfit, 10, 60, 5, '%')}${sl('c-minTV', '최소 거래대금', S.cfg.minTV, 0, 500, 10, '억')}
@@ -1285,7 +1297,7 @@ var _FD = FD;
       flow: `5일 외인 ${fsign(m.foreign5, 0)}억 · 기관 ${fsign(m.inst5, 0)}억, 20일 합계 ${fsign(m.flow20, 0)}억`,
       mom: `RSI ${m.rsi.toFixed(0)}, MACD ${m.hist > 0 ? '강세' : '약세'}, 20일 수익률 ${fpct(m.ret20 * 100)}`,
       vol: `최근 5일 거래량이 20일 평균의 ${m.vr.toFixed(2)}배`,
-      risk: `20일 변동성 ${m.vol20.toFixed(1)}%, 120일 고점 대비 ${fpct(m.dd * 100)}`,
+      risk: `안전성 ${sc.parts.safe.toFixed(0)}점(20일 변동성 ${m.vol20.toFixed(1)}%, 120일 고점 대비 ${fpct(m.dd * 100)})` + (sc.val != null ? ` + 밸류에이션 ${sc.val.toFixed(0)}점을 절반씩 결합` : ' · 밸류에이션 자료가 없어 안전성만 반영'),
     };
     const ref = [];
     const lo20 = Math.min.apply(null, st.c.slice(t - 19, t + 1)), hi20 = Math.max.apply(null, st.c.slice(t - 19, t + 1));
@@ -1602,7 +1614,7 @@ function valCard(code, sc) {
   const vs = sc && sc.val != null ? sc.val : FD_.valScore(v);
   const f = (x, u, neg) => (x == null ? '-' : x <= 0 && neg ? neg : x.toFixed(u === '%' ? 1 : Math.abs(x) < 10 ? 2 : 1) + u);
   return `<div class="card"><h2>밸류에이션<small>${v.fy || ''}년 사업보고서 기준 · 자동</small></h2>
-    <div class="part"><span>밸류에이션 점수 <small class="mute">15%</small></span><div class="bar"><i style="width:${vs}%;background:${vs >= 70 ? 'var(--s-hi)' : vs >= 50 ? 'var(--s-mid)' : 'var(--s-lo)'}"></i></div><b class="num">${vs == null ? '-' : vs.toFixed(0)}</b></div>
+    <div class="part"><span>밸류에이션 점수 <small class="mute">가치/안전성의 50%</small></span><div class="bar"><i style="width:${vs}%;background:${vs >= 70 ? 'var(--s-hi)' : vs >= 50 ? 'var(--s-mid)' : 'var(--s-lo)'}"></i></div><b class="num">${vs == null ? '-' : vs.toFixed(0)}</b></div>
     <div class="expl">PER ${f(v.per, '배', '적자')} · PBR ${f(v.pbr, '배', '자본잠식')} · ROE ${f(v.roe, '%')} — ${vs >= 70 ? '이익·자산 대비 싼 편' : vs <= 30 ? '이익·자산 대비 비싼 편' : '중간 수준'}</div>
     <div class="hint">OpenDART의 직전 사업연도 당기순이익·자본총계와 최근 시가총액으로 계산한 값이라, 증권사가 보여 주는 PER·PBR(지배주주 기준·추정치)과 조금 다를 수 있습니다.</div></div>`;
 }
@@ -1665,14 +1677,49 @@ function ideaCard(i) {
     ${i.thesis ? `<div style="font-size:13px;color:var(--ink2);margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(i.thesis)}</div>` : ''}
     <div class="tags">${m ? `<span class="chip tag">손익비 ${m.rr.toFixed(1)}</span><span class="chip tag ${m.ev > 0 ? 'g-buy' : 'g-exit'}">기대값 ${fpct(m.ev * 100)}</span>${m.w > 0 ? `<span class="chip tag">제안 비중 ${(m.w * 100).toFixed(1)}%</span>` : ''}` : ''}${ne ? `<span class="chip tag g-watch">${FD_.dDay(ne.date, t).label} ${esc(FD_.EVENT_KINDS[ne.kind] || '일정')}</span>` : ''}</div></div></button>`;
 }
+/* ---- DART 공시 이벤트 → 투자 아이디어 후보 ---- */
+const EVT_META = {
+  buyback: { type: 'buyback', ico: '🔄', why: '회사가 자기 주식을 사들이면 유통 물량이 줄고 경영진이 주가를 저평가로 본다는 신호가 될 수 있습니다.', risk: '취득 후 소각 없이 보유만 하거나 실제 매입이 적으면 효과가 작습니다. 공시 본문에서 금액·기간·소각 여부를 확인하세요.' },
+  capex: { type: 'capex', ico: '🏭', why: '신규 시설투자는 몇 분기 뒤 생산능력·매출 증가로 이어질 수 있는 사업 확장 신호입니다.', risk: '투자 규모 대비 수요가 부족하거나 완공이 지연되면 비용만 늘 수 있습니다. 공시 본문에서 투자금액(자기자본 대비)·기간을 확인하세요.' },
+  stake: { type: 'stake', ico: '🤝', why: '타법인 지분 취득은 신사업 진출·지배력 확대·경영권 이슈의 단서가 될 수 있습니다.', risk: '취득 가격이 비싸거나 본업과 무관한 투자이면 오히려 재무 부담이 될 수 있습니다. 공시 본문에서 대상 회사·금액·목적을 확인하세요.' },
+};
+const evtFlt = () => UI.evk || 'all';
+function evtRows() {
+  if (!EVT || !EVT.items) return [];
+  const idx = (st) => (FD_.idxOf(st, G.asOf) != null ? FD_.idxOf(st, G.asOf) : st.c.length - 1);
+  return EVT.items.map((x) => { const st = G.byCode[x.c]; if (!st) return null; const sc = FD_.scoreAt(st, idx(st), S.W); return { x, st, sc, sg: sc ? FD_.signal(sc, { held: false, cfg: S.cfg }) : null, held: !!(S.trades && S.trades.some((t) => t.code === x.c)), watch: S.watch.some((w) => w.code === x.c) }; }).filter(Boolean);
+}
+function evtCard() {
+  let h = `<div class="sec-h"><h2>공시 이벤트 아이디어</h2><span>${EVT ? '갱신 ' + esc(EVT.updated) : '미연결'}</span></div><div class="card">`;
+  if (!EVT) return h + '<div class="empty" style="padding:6px"><b>공시 이벤트가 아직 연결되지 않았습니다</b>OpenDART 인증키(DART_KEY)가 등록돼 있으면 다음 자동 갱신 때 최근 30일의 자사주 취득·시설투자·타법인 지분 취득 공시가 이곳에 모입니다.</div></div>';
+  const all = evtRows(), f = evtFlt(), rows = all.filter((r) => f === 'all' || r.x.k === f);
+  const cnt = (k) => all.filter((r) => r.x.k === k).length;
+  h += `<div class="seg sp" role="group" aria-label="공시 종류" style="margin-bottom:8px">${[['all', '전체 ' + all.length], ['buyback', '자사주 ' + cnt('buyback')], ['capex', '시설투자 ' + cnt('capex')], ['stake', '지분취득 ' + cnt('stake')]].map(([k, l]) => `<button data-act="ev-f" data-k="${k}" aria-pressed="${f === k}">${l}</button>`).join('')}</div>`;
+  // 공시는 사실, 점수는 참고: 매력도·가치 점수가 높은 순으로 보여 줍니다.
+  rows.sort((a, b) => (b.sc ? b.sc.total : -1) - (a.sc ? a.sc.total : -1));
+  const lim = UI.evAll ? 60 : 8;
+  rows.slice(0, lim).forEach((r) => {
+    const m = EVT_META[r.x.k], sc = r.sc;
+    h += `<div style="padding:8px 0;border-top:1px solid var(--line)"><div class="row" style="gap:6px"><button class="item" style="flex:1;border:0;text-align:left;min-width:0" data-act="stock" data-code="${r.x.c}" data-date="${G.asOf}"><div class="main" style="min-width:0">
+      <div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${m.ico} ${esc(r.x.n)} <small class="mute">${r.x.m}</small></div>
+      <div class="row wrap" style="gap:5px;margin-top:4px"><span class="chip tag">${esc(r.x.l)}</span><span class="chip tag">${esc(r.x.d)}</span>${r.x.fix ? '<span class="chip tag">정정</span>' : ''}${r.held ? '<span class="chip tag">보유중</span>' : r.watch ? '<span class="chip tag">관심</span>' : ''}${r.sg ? chipSig(r.sg) : ''}${sc && sc.val != null ? `<span class="chip tag">가치 ${sc.val.toFixed(0)}</span>` : ''}</div></div>
+      ${sc ? '<div style="text-align:right">' + ring(sc.total, 36) + '</div>' : ''}</button></div>
+      <div class="row" style="gap:6px;margin-top:6px"><a class="btn sm ghost" href="${esc(r.x.u)}" target="_blank" rel="noopener">공시 원문</a><button class="btn sm soft" data-act="ev-idea" data-c="${r.x.c}" data-k="${r.x.k}">아이디어로 기록</button></div></div>`;
+  });
+  if (!rows.length) h += '<div class="empty" style="padding:6px">해당 종류의 공시가 없거나, 시장 데이터에 없는 종목입니다.</div>';
+  else if (rows.length > lim) h += `<button class="btn sm ghost block" style="margin-top:6px" data-act="ev-all">전체 ${rows.length}건 보기</button>`;
+  h += '<p class="foot">DART 공시 제목을 분류한 목록입니다. 금액·목적·소각 여부는 공시 원문에서 확인하세요. 점수는 가격·수급·밸류에이션 규칙 평가이며 투자 권유가 아닙니다.</p></div>';
+  return h;
+}
 function viewIdeas() {
   const f = UI.ideaF, list = S.ideas.filter((i) => f === 'all' || i.status === f).sort((a, b) => (a.updated < b.updated ? 1 : -1));
   let h = `<div class="row" style="margin-bottom:10px"><div class="seg sp" role="group" aria-label="상태">${[['all', '전체'], ['watch', '관찰'], ['entry', '진입'], ['done', '완료'], ['drop', '폐기']].map(([k, l]) => `<button data-act="ifilter" data-f="${k}" aria-pressed="${f === k}">${l}</button>`).join('')}</div></div>
     <button class="btn block" data-act="idea-new" style="margin-bottom:12px">＋ 투자 아이디어 기록</button>`;
-  if (!list.length) return h + `<div class="card empty"><b>${S.ideas.length ? '해당 상태의 아이디어가 없습니다' : '기록된 아이디어가 없습니다'}</b>${S.ideas.length ? '' : '지분 경쟁 · 자사주 매입 · CAPEX 완료 · 실적 턴어라운드 같은 가설을 근거, 촉매, 손절 기준과 함께 남겨 보세요.'}</div>`;
-  return h + `<div class="card list">${list.map(ideaCard).join('')}</div>`;
+  const ev = evtCard();
+  if (!list.length) return h + ev + `<div class="card empty"><b>${S.ideas.length ? '해당 상태의 아이디어가 없습니다' : '기록된 아이디어가 없습니다'}</b>${S.ideas.length ? '' : '지분 경쟁 · 자사주 매입 · CAPEX 완료 · 실적 턴어라운드 같은 가설을 근거, 촉매, 손절 기준과 함께 남겨 보세요.'}</div>`;
+  return h + `<div class="card list">${list.map(ideaCard).join('')}</div>` + ev;
 }
-function newIdea(code) { return { id: 0, type: 'other', status: 'watch', conviction: 3, title: '', code: code || '', thesis: '', catalyst: '', risk: '', entry: 0, target: 0, stop: 0, horizon: 12, winProb: 0, stake: { top: 0, second: 0, treasury: 0 }, capex: { amt: 0, start: '', done: '', effect: '', revInc: 0, opInc: 0 }, buybacks: [], checks: {}, log: [], created: todayStr(), updated: todayStr() }; }
+function newIdea(pre) { const o = pre && typeof pre === 'object' ? pre : { code: pre || '' }, code = o.code || ''; return { id: 0, type: o.type || 'other', status: 'watch', conviction: 3, title: o.title || '', code, thesis: o.thesis || '', catalyst: o.catalyst || '', risk: o.risk || '', entry: 0, target: 0, stop: 0, horizon: 12, winProb: 0, stake: { top: 0, second: 0, treasury: 0 }, capex: { amt: 0, start: '', done: '', effect: '', revInc: 0, opInc: 0 }, buybacks: [], checks: {}, log: [], created: todayStr(), updated: todayStr() }; }
 function searchBox(p, label, code, ph) {
   const st = code ? G.byCode[code] : null;
   return `<label class="f" for="${p}-q">${label}</label><input class="in" id="${p}-q" data-in="sq" data-p="${p}" autocomplete="off" placeholder="${ph || '종목명 또는 코드 검색'}" value="${st ? esc(st.name) + ' (' + st.code + ')' : ''}"><div id="${p}-res"></div>`;
@@ -1835,6 +1882,13 @@ Object.assign(EXT_ACT, {
   'macro-import': () => openSheet(sheetMacroImport()),
   'macro-run': () => { const t = $('#mc-text').value.trim(); if (!t) { $('#mc-err').textContent = 'JSON을 붙여넣거나 파일을 선택하세요.'; return; } const r = FD_.parseMacro(t); if (r.error) { $('#mc-err').textContent = r.error; return; } M = Object.assign({}, r.macro, { isSample: false }); kv.set('macro', r.macro); closeSheet(); UI.tab = 'mk'; UI.sub.mk = 'macro'; render(); toast(`지표 ${Object.keys(r.macro.series).length}개를 불러왔습니다.`); },
   'macro-sample': () => { kv.del('macro'); M = Object.assign({}, FD_.genMacroSample(SAMPLE_END), { isSample: true }); render(); toast('샘플 지표로 되돌렸습니다.'); },
+  'ev-f': (el, d) => { UI.evk = d.k; UI.evAll = false; rerender(); },
+  'ev-all': () => { UI.evAll = true; rerender(); },
+  'ev-idea': (el, d) => {
+    const r = (EVT ? EVT.items : []).find((x) => x.c === d.c && x.k === d.k), m = EVT_META[d.k], st = G.byCode[d.c]; if (!r || !m) return;
+    UI.ideaPre = { code: d.c, type: m.type, title: `${r.n} ${r.l} (${r.d} 공시)`, thesis: `[DART ${r.d}] ${r.t}\n${m.why}`, catalyst: `공시 원문 확인 후 실제 집행(매입·투자 진행) 여부 추적: ${r.u}`, risk: m.risk };
+    openSheet(sheetIdeaForm(0));
+  },
   'idea-from-stock': (el, d) => { closeSheet(); UI.ideaPre = d.code; openSheet(sheetIdeaForm(0)); },
 });
 Object.assign(EXT_IN, {
@@ -1938,7 +1992,13 @@ function allSugg(an) {
       case 'reset-all': openSheet(sheetConfirm('모든 거래 기록과 예수금을 삭제합니다. 되돌릴 수 없습니다.', 'reset-yes')); break;
       case 'reset-yes': S.trades = []; S.cash = 0; S.nextId = 1; store.save(); closeSheet(); render(); toast('거래 기록을 삭제했습니다.'); break;
       default: if (EXT_ACT[a]) EXT_ACT[a](el, d); break;
-      case 'w-reset': S.W = Object.assign({}, FD_.DEF_W); S.cfg = Object.assign({}, FD_.DEF_CFG); store.save(); rerender(); break;
+      case 'w-reset': S.W = Object.assign({}, FD_.DEF_W); S.cfg = Object.assign({}, FD_.DEF_CFG); S.profile = 'default'; store.save(); rerender(); toast('기본값으로 되돌렸습니다.'); break;
+      case 'w-prof': {
+        const p = d.p;
+        if (p === 'custom') S.W = Object.assign({}, S.customW || S.W); else S.W = Object.assign({}, FD_.PROFILES[p].W);
+        S.profile = p; if (p === 'custom' && !S.customW) S.customW = Object.assign({}, S.W);
+        store.save(); rerender(); toast(p === 'custom' ? '내 설정을 불러왔습니다.' : FD_.PROFILES[p].label + ' 가중치를 적용했습니다.'); break;
+      }
     }
   });
   document.addEventListener('input', (e) => {
@@ -1960,7 +2020,7 @@ function allSugg(an) {
     if (k === 'tfdate') { UI.tf.priceAuto = true; tfRefresh(); }
     if (k === 'range') {
       const id = el.id;
-      if (id.startsWith('w-')) S.W[id.slice(2)] = +el.value; else S.cfg[id.slice(2)] = +el.value;
+      if (id.startsWith('w-')) { S.W[id.slice(2)] = +el.value; S.profile = 'custom'; S.customW = Object.assign({}, S.W); } else S.cfg[id.slice(2)] = +el.value;
       store.save(); rerender();
     }
     if (k === 'file' && el.files[0]) { const rd = new FileReader(); rd.onload = () => { $('#im-text').value = String(rd.result).slice(0, 30e6); }; rd.readAsText(el.files[0]); }
