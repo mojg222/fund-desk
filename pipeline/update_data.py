@@ -663,6 +663,72 @@ def fetch_valuation(out_path, key, fdr=None, get_bytes=None, get_text=None, paus
     return True
 
 
+# ---- DART 이벤트(자사주 취득 · 시설투자 · 타법인 지분 취득) -> 투자 아이디어 후보 ----
+# 공시목록(list.json)은 회사코드 없이 조회하면 최근 3개월까지만 가능하고, 공시 제목(report_nm)만 제공합니다.
+EVENT_RULES = [  # (종류, 라벨, 포함 단어, 제외 단어)
+    ("buyback", "자사주 취득", ("자기주식취득결정", "자기주식 취득 결정", "자기주식취득신탁계약체결"), ("처분", "해지", "결과보고")),
+    ("capex", "시설투자", ("신규시설투자", "유형자산양수결정", "유형자산 양수 결정", "유형자산취득결정"), ("처분", "양도")),
+    ("stake", "타법인 지분 취득", ("타법인주식및출자증권취득결정", "타법인 주식 및 출자증권 취득 결정"), ("처분",)),
+]
+
+
+def event_kind(name):
+    n = (name or "").replace(" ", "")
+    for k, label, inc, exc in EVENT_RULES:
+        if any(w.replace(" ", "") in n for w in inc) and not any(w in n for w in exc):
+            return k, label
+    return None, None
+
+
+def fetch_events(out_path, key, days=30, max_pages=15, pause=0.2, get_text=None):
+    import urllib.parse
+    get_text = get_text or http_get
+    today = dt.datetime.now(KST).date()
+    bgn, end = (today - dt.timedelta(days=min(days, 90))).strftime("%Y%m%d"), today.strftime("%Y%m%d")
+    seen, items, scanned = set(), [], 0
+    for ty in ("B", "I"):  # B: 주요사항보고, I: 거래소공시(신규시설투자등 자율공시 포함)
+        page, total = 1, 1
+        while page <= total and page <= max_pages:
+            q = urllib.parse.urlencode({"crtfc_key": key, "bgn_de": bgn, "end_de": end, "pblntf_ty": ty, "page_no": page, "page_count": 100})
+            data = json.loads(get_text(f"{DART_API}/list.json?{q}"))
+            st = data.get("status")
+            if st == "013":
+                break
+            if st != "000":
+                raise RuntimeError(f"DART 오류 {st}: {data.get('message', '')}")
+            total = int(data.get("total_page") or 1)
+            for it in data.get("list", []):
+                scanned += 1
+                nm = (it.get("report_nm") or "").strip()
+                sc = (it.get("stock_code") or "").strip()
+                if not sc or not it.get("rcept_no") or it.get("corp_cls") not in ("Y", "K"):
+                    continue  # 상장사(유가·코스닥)만
+                k, label = event_kind(nm)
+                if not k:
+                    continue
+                key2 = (sc, k)  # 같은 종목·같은 종류는 가장 최근 1건만(정정공시 중복 방지)
+                d = it.get("rcept_dt") or ""
+                row = {"c": sc, "n": (it.get("corp_name") or "").strip(), "m": "KOSPI" if it.get("corp_cls") == "Y" else "KOSDAQ", "k": k, "l": label, "t": nm,
+                       "u": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={it['rcept_no']}", "d": f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d,
+                       "fix": "정정" in nm}
+                if key2 in seen:
+                    continue
+                seen.add(key2)
+                items.append(row)
+            page += 1
+            time.sleep(pause)
+    if scanned == 0:
+        raise RuntimeError("조회된 공시가 없습니다.")
+    items.sort(key=lambda x: x["d"], reverse=True)
+    cnt = {}
+    for x in items:
+        cnt[x["k"]] = cnt.get(x["k"], 0) + 1
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump({"updated": today.isoformat(), "days": days, "items": items}, f, ensure_ascii=False)
+    log(f"  공시 {scanned}건 확인 → 자사주 {cnt.get('buyback', 0)} · 시설투자 {cnt.get('capex', 0)} · 지분취득 {cnt.get('stake', 0)}건 저장 ({out_path})")
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
@@ -676,6 +742,7 @@ def main(argv=None):
     ap.add_argument("--skip-news", action="store_true")
     ap.add_argument("--skip-dart", action="store_true")
     ap.add_argument("--skip-val", action="store_true")
+    ap.add_argument("--skip-events", action="store_true")
     a = ap.parse_args(argv)
     ok = 0
     if not a.skip_market:
@@ -715,6 +782,12 @@ def main(argv=None):
                 fetch_dart(os.path.join(a.out, "dart.json"), os.path.join(a.out, "watchlist.txt"), dkey)
             except Exception as e:  # noqa: BLE001
                 log(f"[공시 실패] {str(e).replace(dkey, '***')}")
+        if dkey and not a.skip_events:
+            log("== 공시 이벤트(자사주·시설투자·지분취득) ==")
+            try:
+                fetch_events(os.path.join(a.out, "events.json"), dkey)
+            except Exception as e:  # noqa: BLE001
+                log(f"[이벤트 실패] {str(e).replace(dkey, '***')}")
         if dkey and not a.skip_val:
             log("== 밸류에이션 ==")
             try:
