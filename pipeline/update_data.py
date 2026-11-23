@@ -508,6 +508,161 @@ def fetch_dart(out_path, watch_path, key, days=30, per=5, pause=0.2, get_bytes=N
     return True
 
 
+# ----------------------------------------------------------------------------
+# 5) 밸류에이션 자동 계산 (OpenDART 재무 + FDR 시가총액 → PER·PBR·ROE)
+# ----------------------------------------------------------------------------
+class DartLimit(RuntimeError):
+    pass
+
+
+def _amt(x):
+    """'1,234' / '(1,234)' / '-1,234' → 정수, 값이 없으면 None."""
+    t = str(x or "").replace(",", "").replace(" ", "")
+    if not t or t == "-":
+        return None
+    neg = t.startswith("(") and t.endswith(")")
+    t = t.strip("()")
+    try:
+        v = int(float(t))
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _dart_rows(url, get_text):
+    data = json.loads(get_text(url))
+    st = data.get("status")
+    if st == "013":
+        return []
+    if st == "020":
+        raise DartLimit("DART 하루 호출 한도(20,000회)를 넘었습니다.")
+    if st != "000":
+        raise RuntimeError(f"DART 오류 {st}: {data.get('message', '')}")
+    return data.get("list", [])
+
+
+def dart_pick(rows):
+    """한 회사의 주요계정 행들 → (당기순이익, 자본총계, 'C'|'O'). 연결(CFS) 우선, 없으면 개별(OFS)."""
+    best = {}
+    for r in rows:
+        if r.get("currency") not in (None, "", "KRW"):
+            continue
+        fs = r.get("fs_div") or "OFS"
+        nm = (r.get("account_nm") or "").replace(" ", "")
+        v = _amt(r.get("thstrm_amount"))
+        if v is None:
+            continue
+        d = best.setdefault(fs, {})
+        if nm == "자본총계":
+            d["eq"] = v
+        elif nm.startswith("당기순이익") or nm.startswith("당기순손실") or nm == "분기순이익" or nm == "반기순이익":
+            d.setdefault("ni", v)
+    for fs, tag in (("CFS", "C"), ("OFS", "O")):
+        d = best.get(fs)
+        if d and "eq" in d and "ni" in d:
+            return d["ni"], d["eq"], tag
+    return None
+
+
+def dart_financials(corp_codes, fy, key, get_text, pause=0.3, batch=100, stock_of=None):
+    """{corp_code: (순이익, 자본총계, 구분)}. 다중회사 주요계정(100개씩) 우선, 실패하면 회사별 조회로 대체."""
+    import urllib.parse
+    out = {}
+    for i in range(0, len(corp_codes), batch):
+        chunk = corp_codes[i:i + batch]
+        rows_by = {}
+        q = urllib.parse.urlencode({"crtfc_key": key, "corp_code": ",".join(chunk), "bsns_year": fy, "reprt_code": "11011"})
+        try:
+            for r in _dart_rows(f"{DART_API}/fnlttMultiAcnt.json?{q}", get_text):
+                cc = r.get("corp_code") or (stock_of or {}).get(r.get("stock_code"))
+                if cc:
+                    rows_by.setdefault(cc, []).append(r)
+        except DartLimit:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log(f"  [다중회사 조회 실패→회사별 조회로 대체] {fy}년 {i // batch + 1}번째 묶음: {str(e).replace(key, '***')[:80]}")
+            for cc in chunk:
+                q1 = urllib.parse.urlencode({"crtfc_key": key, "corp_code": cc, "bsns_year": fy, "reprt_code": "11011"})
+                try:
+                    rows_by[cc] = _dart_rows(f"{DART_API}/fnlttSinglAcnt.json?{q1}", get_text)
+                except DartLimit:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(pause / 2)
+        for cc, rows in rows_by.items():
+            got = dart_pick(rows)
+            if got:
+                out[cc] = got
+        time.sleep(pause)
+    return out
+
+
+def valuation_metrics(marcap, ni, eq):
+    """PER·PBR·ROE. 적자(PER)·자본잠식(PBR)은 -1로 표시."""
+    per = round(min(marcap / ni, 9999), 2) if ni > 0 else -1
+    if eq > 0:
+        return per, round(marcap / eq, 2), round(ni / eq * 100, 1)
+    return per, -1, None
+
+
+def fetch_valuation(out_path, key, fdr=None, get_bytes=None, get_text=None, pause=0.3, year=None):
+    get_bytes = get_bytes or http_bytes
+    get_text = get_text or http_get
+    if fdr is None:
+        import FinanceDataReader as fdr  # noqa: N813
+    lst = retry(lambda: fdr.StockListing("KRX"), what="KRX 종목 목록(시가총액)")
+    code_col = "Code" if "Code" in lst.columns else "Symbol"
+    if "Marcap" not in lst.columns:
+        raise RuntimeError("종목 목록에 시가총액(Marcap) 열이 없습니다.")
+    rows = [(str(r[code_col]).zfill(6), str(r.get("Name", "")), float(r["Marcap"] or 0)) for _, r in lst.iterrows()]
+    caps = {c: m for c, n, m in rows if m > 0}
+    names = {c: n for c, n, m in rows}
+    # 우선주는 같은 회사의 보통주 시가총액에 합산 (코드 앞 5자리가 같고 이름이 '보통주명 + …우…')
+    for c, n, m in rows:
+        if m > 0 and c[5] != "0":
+            base = c[:5] + "0"
+            bn = names.get(base)
+            if bn and n.startswith(bn) and "우" in n[len(bn):] and base in caps:
+                caps[base] += m
+    by_code, _ = dart_corp_map(key, get_bytes)
+    codes = [c for c in by_code if c in caps]
+    log(f"  재무 조회 대상 {len(codes)}종목 (상장사 {len(by_code)}건 중 시가총액 확인분)")
+    stock_of = {v: k for k, v in by_code.items()}
+    y = year or dt.datetime.now(KST).year - 1
+    fin, fy_of = {}, {}
+    for fy in (y, y - 1):  # 직전 사업연도 우선, 아직 사업보고서가 없는 회사는 그 전 해로 대체
+        todo = [by_code[c] for c in codes if by_code[c] not in fin]
+        if not todo:
+            break
+        got = dart_financials(todo, str(fy), key, get_text, pause=pause, stock_of=stock_of)
+        for cc, v in got.items():
+            fin[cc] = v
+            fy_of[cc] = fy
+        log(f"  {fy}년 사업보고서: {len(got)}/{len(todo)}종목 확보")
+    res = {}
+    for c in codes:
+        cc = by_code[c]
+        if cc in fin:
+            ni, eq, tag = fin[cc]
+            per, pbr, roe = valuation_metrics(caps[c], ni, eq)
+            res[c] = [per, pbr, roe, fy_of[cc], tag]
+    if not res:
+        raise RuntimeError("밸류에이션을 한 종목도 계산하지 못했습니다. 기존 파일을 유지합니다.")
+    pers = sorted(v[0] for v in res.values() if v[0] > 0)
+    pbrs = sorted(v[1] for v in res.values() if v[1] > 0)
+    if pers and pbrs:
+        mp, mb = pers[len(pers) // 2], pbrs[len(pbrs) // 2]
+        log(f"  점검: PER 중앙값 {mp:.1f}배 · PBR 중앙값 {mb:.2f}배 (보통 PER 5~30, PBR 0.5~3 사이면 정상, 이 범위를 크게 벗어나면 알려 주세요)")
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"asof": dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"), "stocks": res}, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, out_path)
+    log(f"valuation.json 저장: {len(res)}종목")
+    return True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
@@ -520,6 +675,7 @@ def main(argv=None):
     ap.add_argument("--skip-macro", action="store_true")
     ap.add_argument("--skip-news", action="store_true")
     ap.add_argument("--skip-dart", action="store_true")
+    ap.add_argument("--skip-val", action="store_true")
     a = ap.parse_args(argv)
     ok = 0
     if not a.skip_market:
@@ -559,6 +715,12 @@ def main(argv=None):
                 fetch_dart(os.path.join(a.out, "dart.json"), os.path.join(a.out, "watchlist.txt"), dkey)
             except Exception as e:  # noqa: BLE001
                 log(f"[공시 실패] {str(e).replace(dkey, '***')}")
+        if dkey and not a.skip_val:
+            log("== 밸류에이션 ==")
+            try:
+                fetch_valuation(os.path.join(a.out, "valuation.json"), dkey)
+            except Exception as e:  # noqa: BLE001
+                log(f"[밸류에이션 실패] {str(e).replace(dkey, '***')}")
     return 0 if ok else 1
 
 
