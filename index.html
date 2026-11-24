@@ -752,6 +752,7 @@ var _FD = FD;
         kr10y: { name: '국고채 10년', unit: '%', freq: 'D', pts: daily(k10, 3) },
         us10y: { name: '미국 국채 10년', unit: '%', freq: 'D', pts: daily(u10, 3) },
         usBase: { name: '미국 기준금리(상단)', unit: '%', freq: 'D', pts: daily(ub, 2) },
+        vix: { name: 'VIX (미국 변동성지수)', unit: '', freq: 'D', pts: daily(walk(17, 17, 0.06, 1.2, 11, 40), 2) },
         krCpi: { name: '한국 소비자물가(전년비)', unit: '%', freq: 'M', pts: mo(2.2, 2.1, 0.25) },
         usCpi: { name: '미국 소비자물가(전년비)', unit: '%', freq: 'M', pts: mo(3.0, 2.9, 0.25) },
       },
@@ -779,8 +780,14 @@ var _FD = FD;
     if (m.kr10y && m.kr3y) { const sl = m.kr10y.last - m.kr3y.last; add('curve', '장단기 스프레드', sl < 0 ? -0.7 : sl < 0.2 ? -0.2 : 0.3, `10년-3년 스프레드 ${sl.toFixed(2)}%p${sl < 0 ? ' (역전: 경기 둔화 신호)' : sl < 0.2 ? ' (평탄)' : ''}`); }
     if (m.krCpi) { const c = m.krCpi.last, dev = Math.abs(c - 2); add('cpi', '물가', dev <= 0.5 ? 0.5 : dev <= 1.5 ? 0 : -1, `한국 물가 상승률 ${c.toFixed(1)}%로 목표(2%) ${dev <= 0.5 ? '부근, 통화정책 여력 양호' : dev <= 1.5 ? '와 소폭 괴리' : '와 괴리 큼, 정책 불확실성'}`); }
     if (m.krBase && m.krCpi) { const rr = m.krBase.last - m.krCpi.last; add('real', '실질금리', rr > 1.5 ? -0.4 : rr < 0 ? 0.3 : 0, `기준금리-물가 = ${rr.toFixed(1)}%p${rr > 1.5 ? ' (긴축적)' : rr < 0 ? ' (완화적)' : ' (중립권)'}`); }
+    // VIX(미국 변동성지수): 20 이하 안정, 30 이상 공포. 한 지표가 국면을 뒤집지 못하도록 전체의 약 12%만 반영
+    if (m.vix) {
+      const v = m.vix.last, ch = m.vix.d1m;
+      add('vix', '변동성(VIX)', (20 - v) / 10, `VIX ${v.toFixed(1)}${v < 15 ? ' (매우 안정)' : v < 20 ? ' (안정)' : v < 30 ? ' (경계)' : ' (공포 구간)'}${ch != null ? `, 한 달 전보다 ${ch > 0 ? '+' : ''}${ch.toFixed(1)}` : ''}`);
+      f[f.length - 1].w = f.length > 1 ? 0.12 / 0.88 * (f.length - 1) : 1;
+    }
     if (!f.length) return null;
-    const avg = f.reduce((s, x) => s + x.score, 0) / f.length, score = clamp(50 + 50 * avg, 0, 100);
+    const wsum = f.reduce((s, x) => s + (x.w || 1), 0), avg = f.reduce((s, x) => s + x.score * (x.w || 1), 0) / wsum, score = clamp(50 + 50 * avg, 0, 100);
     return { score, label: score >= 60 ? '위험선호' : score >= 40 ? '중립' : '위험회피', factors: f, summary: m };
   }
   function parseMacro(text) {
@@ -1437,10 +1444,10 @@ function viewMacro() {
     const lc = reg.label === '위험선호' ? 'g-buy' : reg.label === '중립' ? 'g-hold' : 'g-reduce';
     h += `<div class="card"><div class="row"><div><div class="ink2" style="font-size:13px">매크로 레짐</div><div class="row" style="margin-top:2px"><span class="big">${reg.label}</span><span class="chip ${lc}">${reg.score.toFixed(0)}점</span></div></div><span class="sp"></span>${ring(reg.score, 58)}</div>
       <div style="margin-top:10px">${reg.factors.map((f) => { const c = f.score > 0.25 ? ['g-buy', '우호'] : f.score < -0.25 ? ['g-reduce', '부담'] : ['g-hold', '중립']; return `<div class="row" style="align-items:flex-start;padding:5px 0;border-top:1px solid var(--line)"><span class="chip ${c[0]}" style="min-width:42px;justify-content:center">${c[1]}</span><div style="font-size:13px"><b>${f.label}</b> <span class="ink2">${esc(f.text)}</span></div></div>`; }).join('')}</div>
-      <div class="hint">환율·금리·금리차·장단기 스프레드·물가·실질금리 6개 요인을 규칙으로 점수화한 참고 지표입니다.</div></div>`;
+      <div class="hint">환율·금리·금리차·장단기 스프레드·물가·실질금리와 VIX(비중 약 12%)를 규칙으로 점수화한 참고 지표입니다.</div></div>`;
   }
   const grp = (t, ids) => { const l = ids.filter((i) => sm[i]); return l.length ? `<div class="sec-h"><h2>${t}</h2><span>${l.length}개 지표</span></div>${l.map((i) => macroCard(sm[i])).join('')}` : ''; };
-  h += grp('금리', ['krBase', 'kr3y', 'kr10y', 'us10y', 'usBase']) + grp('환율', ['usdkrw']) + grp('인플레이션', ['krCpi', 'usCpi']);
+  h += grp('금리', ['krBase', 'kr3y', 'kr10y', 'us10y', 'usBase']) + grp('환율', ['usdkrw']) + grp('인플레이션', ['krCpi', 'usCpi']) + grp('변동성', ['vix']);
   const dr = [];
   if (sm.kr10y && sm.kr3y) dr.push(['장단기 스프레드 (국고 10년−3년)', sm.kr10y.last - sm.kr3y.last, '%p']);
   if (sm.kr10y && sm.us10y) dr.push(['한미 10년 금리차 (한국−미국)', sm.kr10y.last - sm.us10y.last, '%p']);
@@ -1903,7 +1910,7 @@ function sheetMacroImport() {
     <div class="card" style="margin-top:10px;font-size:11.5px;font-family:ui-monospace,Menlo,monospace;overflow-x:auto;white-space:pre">{"asof":"2026-11-20","series":{
  "usdkrw":{"name":"원/달러 환율","unit":"원","freq":"D",
   "pts":[["2026-11-19",1401.2],["2026-11-20",1398.7]]}}}</div>
-    <p class="hint">인식하는 id: usdkrw, krBase, kr3y, kr10y, us10y, usBase, krCpi, usCpi (물가는 전년 동월 대비 %).</p>
+    <p class="hint">인식하는 id: usdkrw, krBase, kr3y, kr10y, us10y, usBase, krCpi, usCpi, vix (물가는 전년 동월 대비 %).</p>
     <label class="f" for="mc-file">파일 선택</label><input class="in" type="file" id="mc-file" data-in="mfile" accept=".json,.txt">
     <label class="f" for="mc-text">또는 붙여넣기</label><textarea class="in" id="mc-text" placeholder="JSON 내용"></textarea>
     <div class="hint" id="mc-err" style="color:var(--g-exit);min-height:18px"></div><button class="btn block" data-act="macro-run">가져오기</button>`;
