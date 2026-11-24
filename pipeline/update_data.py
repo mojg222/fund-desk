@@ -57,7 +57,7 @@ def retry(fn, tries=3, wait=1.5, what=""):
 # ----------------------------------------------------------------------------
 # 1) 시장 데이터 (KRX)
 # ----------------------------------------------------------------------------
-def fetch_market(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.35, stock=None):
+def fetch_market(out_path, days=250, top_kospi=250, top_kosdaq=350, pause=0.35, stock=None):
     if stock is None:
         from pykrx import stock  # noqa: PLC0415  (필요할 때만 불러옴)
     today = dt.datetime.now(KST).date()
@@ -136,7 +136,7 @@ def fetch_market(out_path, days=130, top_kospi=250, top_kosdaq=350, pause=0.35, 
     log(f"market.csv 저장: {len(rows)}행, 종목 {len(names)}개, 순매수 단위는 원")
 
 
-def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=5000):
+def fetch_market_fdr(out_path, days=250, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=5000, etf_days=130):
     """대체 경로: FinanceDataReader (KRX 로그인 불필요). 수급(외국인/기관) 열은 비워 둡니다.
     앱은 수급 열이 없으면 수급 항목을 제외하고 나머지 4개 항목으로 점수를 계산합니다."""
     if fdr is None:
@@ -167,7 +167,7 @@ def fetch_market_fdr(out_path, days=130, top_kospi=1000, top_kosdaq=2000, pause=
                 if mk == "ETF":
                     log(f"[ETF 제외] {code} {r.get('Name', '')}: 가격 이력 {0 if df is None else len(df)}일 (71일 미만)")
                 continue
-            df = df.tail(days)
+            df = df.tail(min(days, etf_days) if mk == "ETF" else days)
             nm = str(r.get("Name", code))
             sec = str(r[sec_col]) if sec_col and r[sec_col] == r[sec_col] else ("ETF" if mk == "ETF" else "-")
             for idx, x in df.iterrows():
@@ -733,7 +733,7 @@ def fetch_events(out_path, key, days=30, max_pages=15, pause=0.2, get_text=None)
 def main(argv=None):
     ap = argparse.ArgumentParser(description="운용데스크 데이터 갱신")
     ap.add_argument("--out", default="data")
-    ap.add_argument("--days", type=int, default=130, help="가져올 거래일 수 (점수 계산에 최소 70 필요)")
+    ap.add_argument("--days", type=int, default=250, help="가져올 거래일 수 (점수 계산에 최소 70, 가상투자 재생에는 많을수록 좋음)")
     ap.add_argument("--top-kospi", type=int, default=1000)
     ap.add_argument("--top-kosdaq", type=int, default=2000)
     ap.add_argument("--top-etf", type=int, default=5000)
