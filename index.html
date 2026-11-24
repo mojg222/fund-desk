@@ -295,7 +295,7 @@ const FD = (function () {
 
   function scoreAt(st, t, W) {
     if (t == null || t < MIN_IDX || t >= st.c.length) return null;
-    const key = t + '|' + wKey(W) + (st.val ? '|v' + st.val.per + ',' + st.val.pbr + ',' + st.val.roe : '');
+    const key = t + '|' + wKey(W) + (W.noVal ? '|nv' : st.val ? '|v' + st.val.per + ',' + st.val.pbr + ',' + st.val.roe : '');
     st._sc = st._sc || {};
     if (st._sc[key]) return st._sc[key];
 
@@ -349,7 +349,7 @@ const FD = (function () {
 
     // 5) 가치/안전성: 변동성·낙폭·과열(안전성)에 밸류에이션 점수(OpenDART 자동)를 절반씩 결합. 밸류에이션 자료가 없는 종목은 안전성만 사용
     const safe = 0.4 * (100 - scale(vol20, 1, 4)) + 0.3 * scale(dd, -0.25, 0) + 0.3 * (100 - scale(overext, 0.06, 0.2));
-    const val = st.val ? valScore(st.val) : null;
+    const val = st.val && !W.noVal ? valScore(st.val) : null;
     const risk = val == null ? safe : safe * (1 - VAL_SHARE) + val * VAL_SHARE;
 
     const parts = { trend, mom, flow, vol, risk, safe };
@@ -855,6 +855,80 @@ var _FD = FD;
     event: ['이벤트의 확정 일정과 불확실성을 구분했다', '이미 주가에 반영된 정도를 점검했다', '실패 시 손절 기준을 정했다'],
     other: ['투자 논거와 반증 조건을 적었다', '손절·목표가를 정했다'],
   };
+  /* ---------- 가상투자(과거 재생) ----------
+     시작일부터 하루씩 재생합니다. 신호는 그날 종가 기준으로 계산하고, 주문은 다음 거래일 종가에 체결한다고 가정합니다(미래 정보 사용 방지).
+     밸류에이션은 과거 시점 값이 없어 제외하고 계산합니다. 벤치마크는 비교 종목 전체의 동일가중 평균 수익률입니다. */
+  function paperTrade(stocks, o) {
+    o = o || {};
+    const W = Object.assign({}, o.W || FD.DEF_W, { noVal: 1 }), cfg = Object.assign({}, FD.DEF_CFG, o.cfg || {});
+    const maxPos = o.maxPos || 8, capital = o.capital || 1e8, feeR = o.fee == null ? 0.00015 : o.fee, taxR = o.tax == null ? 0.0018 : o.tax, slipR = o.slip == null ? 0.001 : o.slip;
+    const stopLoss = o.stopLoss != null ? o.stopLoss : cfg.stopLoss, maxW = (cfg.maxWeight || 25) / 100;
+    const sig = Object.assign({}, cfg, { stopLoss });
+    const lastD = stocks.reduce((m, s) => (s.d[s.d.length - 1] > m ? s.d[s.d.length - 1] : m), '');
+    // 유니버스: ETF 제외, 최근 거래대금 상위 N종목(계산 시간 제한)
+    let uni = stocks.filter((s) => s.market !== 'ETF' && s.c.length > FD.MIN_IDX + 5);
+    const tvOf = (s) => { let t = 0; const n = s.c.length; for (let k = Math.max(0, n - 20); k < n; k++) t += s.c[k] * s.v[k]; return t; };
+    uni.sort((a, b) => tvOf(b) - tvOf(a)); uni = uni.slice(0, o.top || 300);
+    const dset = new Set(); uni.forEach((s) => s.d.forEach((d) => dset.add(d)));
+    const dates = Array.from(dset).sort();
+    const first = uni.reduce((m, s) => (s.d[FD.MIN_IDX] && (!m || s.d[FD.MIN_IDX] < m) ? s.d[FD.MIN_IDX] : m), '');
+    const start = o.start && o.start > first ? o.start : first;
+    const days = dates.filter((d) => d >= start);
+    if (days.length < 3) return null;
+    const px = (s, d) => { const i = FD.idxOf(s, d); return i == null ? null : s.c[i]; };
+    let cash = capital, pos = {}, pend = [], trades = [], curve = [], bench = 1, closed = [], turnover = 0;
+    const by = {}; uni.forEach((s) => { by[s.code] = s; });
+    for (let di = 0; di < days.length; di++) {
+      const d = days[di];
+      // 1) 전일 신호 주문을 오늘 종가에 체결
+      const todo = pend; pend = [];
+      todo.filter((x) => x.side === 'sell').concat(todo.filter((x) => x.side === 'buy')).forEach((x) => {
+        const s = by[x.code], p = px(s, d); if (p == null) { if (x.side === 'sell') pend.push(x); return; }
+        if (x.side === 'sell') {
+          const ps = pos[x.code]; if (!ps) return;
+          const fill = p * (1 - slipR), gross = ps.qty * fill, fee = gross * (feeR + taxR); cash += gross - fee;
+          const pnl = gross - fee - ps.cost, pct = (gross - fee) / ps.cost - 1;
+          trades.push({ d, code: x.code, name: s.name, side: 'sell', px: fill, qty: ps.qty, amt: gross, pnl, pct, why: x.why }); closed.push({ pnl, pct, days: di - ps.di }); turnover += gross; delete pos[x.code];
+        } else {
+          if (pos[x.code] || Object.keys(pos).length >= maxPos) return;
+          const eq = cash + Object.keys(pos).reduce((a, k) => { const q = px(by[k], d); return a + pos[k].qty * (q == null ? pos[k].last : q); }, 0);
+          const budget = Math.min(eq / maxPos, eq * maxW, cash / (1 + feeR));
+          const fill = p * (1 + slipR), qty = Math.floor(budget / fill); if (qty < 1) return;
+          const amt = qty * fill, fee = amt * feeR; cash -= amt + fee;
+          pos[x.code] = { qty, avg: (amt + fee) / qty, cost: amt + fee, di, d, last: p };
+          trades.push({ d, code: x.code, name: s.name, side: 'buy', px: fill, qty, amt, why: x.why }); turnover += amt;
+        }
+      });
+      // 2) 평가·벤치마크
+      let val = 0; Object.keys(pos).forEach((k) => { const q = px(by[k], d); if (q != null) pos[k].last = q; val += pos[k].qty * pos[k].last; });
+      if (di > 0) { let sr = 0, n = 0; const pd = days[di - 1]; uni.forEach((s) => { const a = px(s, pd), b = px(s, d); if (a > 0 && b > 0) { sr += b / a - 1; n++; } }); if (n) bench *= 1 + sr / n; }
+      curve.push({ d, eq: cash + val, bench: bench * capital });
+      // 3) 오늘 종가 기준 신호 → 내일 주문
+      if (di === days.length - 1) break;
+      Object.keys(pos).forEach((k) => {
+        const s = by[k], sc = FD.scoreAt(s, FD.idxOf(s, d), W); if (!sc) return;
+        const sg = FD.signal(sc, { held: true, pnlPct: (pos[k].last / pos[k].avg - 1) * 100, cfg: sig });
+        if (sg.level === 'exit' || sg.level === 'reduce') pend.push({ side: 'sell', code: k, why: (sg.level === 'exit' ? '매도 신호: ' : '비중축소 신호: ') + (sg.reasons[0] || '') });
+      });
+      const free = maxPos - Object.keys(pos).length + pend.filter((x) => x.side === 'sell').length;
+      if (free > 0) {
+        const cand = [];
+        uni.forEach((s) => { if (pos[s.code]) return; const sc = FD.scoreAt(s, FD.idxOf(s, d), W); if (!sc || sc.metrics.tv20 < cfg.minTV) return; const sg = FD.signal(sc, { held: false, cfg: sig }); if (sg.level === 'buy') cand.push({ s, sc, sg }); });
+        cand.sort((a, b) => b.sc.total - a.sc.total);
+        cand.slice(0, free).forEach((c) => pend.push({ side: 'buy', code: c.s.code, why: '신규 매수 후보 (매력도 ' + c.sc.total.toFixed(0) + '점)' }));
+      }
+    }
+    const last = curve[curve.length - 1], eqs = curve.map((x) => x.eq);
+    let peak = -1, mdd = 0; eqs.forEach((v) => { peak = Math.max(peak, v); mdd = Math.min(mdd, v / peak - 1); });
+    const wins = closed.filter((c) => c.pnl > 0), loss = closed.filter((c) => c.pnl <= 0);
+    const avg = (a, f) => (a.length ? a.reduce((s, x) => s + f(x), 0) / a.length : 0);
+    const open = Object.keys(pos).map((k) => ({ code: k, name: by[k].name, qty: pos[k].qty, avg: pos[k].avg, last: pos[k].last, since: pos[k].d, pct: (pos[k].last / pos[k].avg - 1) * 100, value: pos[k].qty * pos[k].last }));
+    return {
+      start: days[0], end: days[days.length - 1], days: days.length, universe: uni.length, curve, trades, open, cash,
+      stats: { ret: last.eq / capital - 1, bench: last.bench / capital - 1, mdd, nTrades: trades.length, nClosed: closed.length, winRate: closed.length ? wins.length / closed.length : null,
+        avgWin: avg(wins, (x) => x.pct), avgLoss: avg(loss, (x) => x.pct), avgHold: avg(closed, (x) => x.days), turnover: turnover / capital, capital, equity: last.eq },
+    };
+  }
   const TYPES = { stake: '지분 경쟁', buyback: '자사주 매입', capex: 'CAPEX 완료', turn: '실적 턴어라운드', event: '이벤트', other: '기타' };
   const EVENT_KINDS = { capex: 'CAPEX 완공', effect: '증설 효과 반영', earn: '실적 발표', disc: '공시·IR', agm: '주주총회', macro: '매크로', other: '기타' };
   function dDay(date, today) { const n = daysBetween(today, date); return { n, label: n === 0 ? 'D-Day' : n > 0 ? 'D-' + n : 'D+' + -n }; }
@@ -959,7 +1033,7 @@ var _FD = FD;
     return { mode, cashCur: an.cashPct / 100, cashTgt: 1 - sumT, rows: out, buy, sell, turnover: Math.max(buy, sell) / an.totalAsset, totalAsset: an.totalAsset };
   }
 
-  Object.assign(FD, { recommend, allocate, rebalance, portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
+  Object.assign(FD, { paperTrade, recommend, allocate, rebalance, portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
 })(_FD);
 
 
@@ -1387,7 +1461,7 @@ var _FD = FD;
   function render() {
     const views = {
       home: viewHome,
-      pf: () => subSeg('pf', [['hold', '보유종목'], ['wl', '관심종목'], ['rc', '추천 포트'], ['jr', '매매일지']]) + (UI.sub.pf === 'jr' ? viewJournal() : UI.sub.pf === 'wl' ? viewWatch() : UI.sub.pf === 'rc' ? viewReco() : viewPortfolio()),
+      pf: () => subSeg('pf', [['hold', '보유종목'], ['wl', '관심종목'], ['rc', '추천 포트'], ['pt', '가상투자'], ['jr', '매매일지']]) + (UI.sub.pf === 'jr' ? viewJournal() : UI.sub.pf === 'pt' ? viewPaper() : UI.sub.pf === 'wl' ? viewWatch() : UI.sub.pf === 'rc' ? viewReco() : viewPortfolio()),
       mk: () => subSeg('mk', [['rank', '매력도 TOP10'], ['macro', '금리·환율·물가']]) + (UI.sub.mk === 'macro' ? viewMacro() : viewRank()),
       idea: () => subSeg('idea', [['ideas', '아이디어'], ['cal', '일정']]) + (UI.sub.idea === 'cal' ? viewCal() : viewIdeas()),
       set: viewSettings,
@@ -1684,6 +1758,51 @@ function ideaCard(i) {
     ${i.thesis ? `<div style="font-size:13px;color:var(--ink2);margin-top:4px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(i.thesis)}</div>` : ''}
     <div class="tags">${m ? `<span class="chip tag">손익비 ${m.rr.toFixed(1)}</span><span class="chip tag ${m.ev > 0 ? 'g-buy' : 'g-exit'}">기대값 ${fpct(m.ev * 100)}</span>${m.w > 0 ? `<span class="chip tag">제안 비중 ${(m.w * 100).toFixed(1)}%</span>` : ''}` : ''}${ne ? `<span class="chip tag g-watch">${FD_.dDay(ne.date, t).label} ${esc(FD_.EVENT_KINDS[ne.kind] || '일정')}</span>` : ''}</div></div></button>`;
 }
+/* ---------- 가상투자 ---------- */
+const PT = { start: 'max', prof: 'cur', n: 8, stop: 8, all: false, cache: {} };
+function ptRun() {
+  const W = PT.prof === 'short' ? FD_.PROFILES.short.W : PT.prof === 'long' ? FD_.PROFILES.long.W : S.W;
+  const key = [G.asOf, G.stocks.length, PT.start, PT.n, PT.stop, S.cfg.maxWeight, S.cfg.minTV, FD_.DEF_W && Object.keys(W).map((k) => W[k]).join(',')].join('|');
+  if (PT.cache.key === key) return PT.cache.res;
+  const days = G.dates.filter((d) => d >= (G.rankDates[0] || ''));
+  const start = PT.start === 'max' ? '' : days[Math.max(0, days.length - (PT.start === '3m' ? 63 : 126))];
+  const res = FD_.paperTrade(G.stocks, { W, maxPos: PT.n, stopLoss: PT.stop, cfg: S.cfg, start });
+  PT.cache = { key, res }; return res;
+}
+function ptChart(cv) {
+  const w = 340, h = 150, p = 6, a = cv.map((x) => x.eq), b = cv.map((x) => x.bench), all = a.concat(b), lo = Math.min.apply(null, all), hi = Math.max.apply(null, all);
+  const x = (i) => p + ((w - 2 * p) * i) / (cv.length - 1), y = (v) => p + (h - 2 * p) * (1 - (v - lo) / (hi - lo || 1));
+  const path = (arr) => arr.map((v, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join('');
+  const base = y(a[0]);
+  return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;display:block" role="img" aria-label="가상투자와 시장 평균 수익 곡선"><line x1="${p}" x2="${w - p}" y1="${base.toFixed(1)}" y2="${base.toFixed(1)}" stroke="var(--line)" stroke-dasharray="3 3"/><path d="${path(b)}" fill="none" stroke="var(--mute)" stroke-width="2" stroke-dasharray="5 3" stroke-linejoin="round"/><path d="${path(a)}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/></svg>
+    <div class="row wrap" style="gap:4px 14px;font-size:12px;margin-top:4px"><span class="ink2" style="white-space:nowrap"><b style="color:var(--accent)">━</b> 가상투자</span><span class="ink2" style="white-space:nowrap"><b style="color:var(--mute)">╍</b> 시장 평균(동일가중)</span><span class="mute num" style="white-space:nowrap;margin-left:auto">${esc(cv[0].d)} ~ ${esc(cv[cv.length - 1].d)}</span></div>`;
+}
+function viewPaper() {
+  const opt = (k, vals) => `<div class="row wrap" style="gap:6px;margin-top:8px"><span class="ink2" style="font-size:13px;width:64px">${k[1]}</span>${vals.map(([v, l]) => `<button class="btn sm ${String(PT[k[0]]) === String(v) ? '' : 'ghost'}" data-act="pt-set" data-k="${k[0]}" data-v="${v}" aria-pressed="${String(PT[k[0]]) === String(v)}">${l}</button>`).join('')}</div>`;
+  let h = `<div class="card"><h2>가상투자<small>매력도 신규 매수 후보를 과거에 그대로 따라 샀다면</small></h2>
+    ${opt(['start', '기간'], [['max', '최대'], ['6m', '6개월'], ['3m', '3개월']])}${opt(['prof', '가중치'], [['cur', '현재 설정'], ['short', '단기형'], ['long', '중장기형']])}${opt(['n', '종목 수'], [[5, '5'], [8, '8'], [10, '10']])}${opt(['stop', '손절'], [[5, '-5%'], [8, '-8%'], [12, '-12%']])}
+    <div class="hint" style="margin-top:8px">신호는 그날 종가로 계산하고 다음 거래일 종가에 체결한다고 가정합니다. 수수료·세금·슬리피지를 반영하고, 신호가 매도·비중축소로 바뀌거나 손절 기준에 닿으면 매도합니다. 값을 바꾸면 바로 다시 계산합니다.</div></div>`;
+  const r = ptRun();
+  if (!r) return h + '<div class="card empty"><b>재생할 기간이 부족합니다</b>가격 이력이 충분히 쌓이면(약 70거래일 이상) 표시됩니다.</div>';
+  const s = r.stats, ex = s.ret - s.bench;
+  const T = (k, v, sub, c) => `<div class="tile"><div class="k">${k}</div><div class="v num ${c || ''}" style="font-size:17px">${v}</div><div class="s">${sub || ''}</div></div>`;
+  h += `<div class="sec-h"><h2>결과</h2><span>${r.days}거래일 · ${r.universe}종목 대상</span></div><div class="card"><div class="tiles">
+    ${T('가상투자 수익률', fpct(s.ret * 100), '자산 ' + fn(Math.round(s.equity / 1e4)) + '만원', cls(s.ret))}${T('시장 대비', fpct(ex * 100), '시장 평균 ' + fpct(s.bench * 100), cls(ex))}
+    ${T('최대낙폭', fpct(s.mdd * 100), '고점 대비', cls(s.mdd))}${T('승률', s.winRate == null ? '-' : (s.winRate * 100).toFixed(0) + '%', s.nClosed + '건 청산 · 평균 보유 ' + s.avgHold.toFixed(0) + '일')}
+    ${T('평균 수익/손실', fpct(s.avgWin * 100) + ' / ' + fpct(s.avgLoss * 100), '청산 거래 기준')}${T('거래', s.nTrades + '회', '회전율 ' + (s.turnover * 100).toFixed(0) + '%')}</div>
+    <div style="margin-top:12px">${ptChart(r.curve)}</div>`;
+  const few = r.days < 120 || s.nClosed < 20;
+  h += `<div class="hint" style="margin-top:8px">${few ? '재생 기간이 짧거나 청산 거래가 적어 우연의 영향이 큽니다. 이력이 더 쌓일수록 믿을 만해집니다. ' : ''}밸류에이션은 과거 시점 값이 없어 제외했고, 상장폐지 종목이 빠져 있어 실제보다 좋게 나올 수 있습니다. 과거 성과가 앞으로를 보장하지 않습니다.</div></div>`;
+  h += `<div class="sec-h"><h2>현재 가상 보유</h2><span>${r.open.length}종목 · 현금 ${fn(Math.round(r.cash / 1e4))}만원</span></div><div class="card">`;
+  h += r.open.length ? r.open.sort((a, b) => b.value - a.value).map((x) => `<button class="item" style="border:0;text-align:left;width:100%;padding:8px 0;border-top:1px solid var(--line)" data-act="stock" data-code="${x.code}" data-date="${G.asOf}"><div class="row" style="gap:8px"><div class="sp" style="min-width:0"><b>${esc(x.name)}</b><div class="mute num" style="font-size:12px">${esc(x.since)} 매수 · 평단 ${fn(x.avg)}원</div></div><div style="text-align:right" class="num"><b class="${cls(x.pct)}">${fpct(x.pct)}</b><div class="mute" style="font-size:12px">${fn(Math.round(x.value / 1e4))}만원</div></div></div></button>`).join('') : '<div class="empty" style="padding:6px">현재 보유한 종목이 없습니다.</div>';
+  h += '</div>';
+  const tr = r.trades.slice().reverse(), lim = PT.all ? 200 : 15;
+  h += `<div class="sec-h"><h2>거래 내역</h2><span>최근순 ${Math.min(lim, tr.length)}/${tr.length}건</span></div><div class="card">`;
+  h += tr.slice(0, lim).map((x) => `<div style="padding:7px 0;border-top:1px solid var(--line)"><div class="row" style="gap:8px"><span class="chip ${x.side === 'buy' ? 'g-buy' : 'g-reduce'}">${x.side === 'buy' ? '매수' : '매도'}</span><b class="sp" style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(x.name)}</b><span class="mute num" style="font-size:12px">${esc(x.d)}</span></div><div class="row" style="gap:8px;margin-top:3px"><span class="ink2" style="font-size:12px;flex:1">${esc(x.why || '')}</span><span class="num" style="font-size:13px">${fn(x.px)}원 × ${fn(x.qty)}${x.side === 'sell' ? ` <b class="${cls(x.pct)}">${fpct(x.pct * 100)}</b>` : ''}</span></div></div>`).join('');
+  if (tr.length > lim) h += '<button class="btn sm ghost block" style="margin-top:6px" data-act="pt-all">더 보기</button>';
+  return h + '<p class="foot">규칙 기반 모의 시험이며 투자 권유가 아닙니다.</p></div>';
+}
+
 /* ---- DART 공시 이벤트 → 투자 아이디어 후보 ---- */
 const EVT_META = {
   buyback: { type: 'buyback', ico: '🔄', why: '회사가 자기 주식을 사들이면 유통 물량이 줄고 경영진이 주가를 저평가로 본다는 신호가 될 수 있습니다.', risk: '취득 후 소각 없이 보유만 하거나 실제 매입이 적으면 효과가 작습니다. 공시 본문에서 금액·기간·소각 여부를 확인하세요.' },
@@ -1889,6 +2008,8 @@ Object.assign(EXT_ACT, {
   'macro-import': () => openSheet(sheetMacroImport()),
   'macro-run': () => { const t = $('#mc-text').value.trim(); if (!t) { $('#mc-err').textContent = 'JSON을 붙여넣거나 파일을 선택하세요.'; return; } const r = FD_.parseMacro(t); if (r.error) { $('#mc-err').textContent = r.error; return; } M = Object.assign({}, r.macro, { isSample: false }); kv.set('macro', r.macro); closeSheet(); UI.tab = 'mk'; UI.sub.mk = 'macro'; render(); toast(`지표 ${Object.keys(r.macro.series).length}개를 불러왔습니다.`); },
   'macro-sample': () => { kv.del('macro'); M = Object.assign({}, FD_.genMacroSample(SAMPLE_END), { isSample: true }); render(); toast('샘플 지표로 되돌렸습니다.'); },
+  'pt-set': (el, d) => { PT[d.k] = (d.k === 'n' || d.k === 'stop') ? +d.v : d.v; PT.all = false; rerender(); },
+  'pt-all': () => { PT.all = true; rerender(); },
   'ev-f': (el, d) => { UI.evk = d.k; UI.evAll = false; rerender(); },
   'ev-all': () => { UI.evAll = true; rerender(); },
   'ev-idea': (el, d) => {
