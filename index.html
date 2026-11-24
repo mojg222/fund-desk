@@ -1267,6 +1267,8 @@ var _FD = FD;
     let h = `<div class="row" style="margin-bottom:10px"><button class="btn" data-act="trade-new" data-side="buy">＋ 매수 기록</button><button class="btn ghost" data-act="trade-new" data-side="sell">매도 기록</button><span class="sp"></span><button class="btn sm soft" data-act="cash-open">예수금 ${fwon(S.cash)}</button></div>`;
     if (!an.rows.length) return h + `<div class="card empty"><b>등록된 보유종목이 없습니다</b>매수 기록을 남기면 이곳에 포트폴리오가 만들어집니다.
       <div style="margin-top:12px"><button class="btn ghost" data-act="sample-portfolio">샘플 포트로 체험</button></div></div>`;
+    const nd = an.rows.filter((r) => r.noData);
+    if (nd.length) h += `<div class="card" style="border-left:4px solid var(--g-reduce)"><b>시세 자료가 없는 보유종목 ${nd.length}개</b><div class="hint" style="margin-top:4px">${nd.map((r) => esc(r.st ? r.st.name : r.code)).join(', ')} — 오늘 데이터에 가격이 없어 평가금액을 매입가로 계산 중입니다. ETF라면 자동 갱신(Update data)이 ETF를 받아 오면 정상 표시됩니다.</div></div>`;
     h += `<div class="card"><div class="tiles">
       <div class="tile"><div class="k">평가금액</div><div class="v num">${fwon(an.mvTotal)}</div><div class="s num">매입 ${fwon(an.costTotal)}</div></div>
       <div class="tile"><div class="k">평가손익</div><div class="v num ${cls(an.pnl)}">${arrow(an.pnl)} ${fpct(an.pnlPct)}</div><div class="s num ${cls(an.pnl)}">${fsign(an.pnl)}원</div></div>
@@ -1585,7 +1587,7 @@ function rebalCard(an) {
   return h;
 }
 /* ---------- 뉴스 · 공시 (보유종목, 관심종목 공용) ---------- */
-const holdItems = (an) => an.rows.map((r) => ({ code: r.code, name: r.st.name }));
+const holdItems = (an) => an.rows.map((r) => ({ code: r.code, name: r.st ? r.st.name : r.code }));
 const watchItems = () => S.watch.filter((w) => G.byCode[w.code]).map((w) => ({ code: w.code, name: G.byCode[w.code].name }));
 const newsOf = (x) => (NEWS && (NEWS.stocks[x.code] || NEWS.stocks[x.name])) || null;
 const dartOf = (x) => (DART && DART.stocks[x.code]) || null;
