@@ -102,7 +102,7 @@ def fetch_market(out_path, days=250, top_kospi=250, top_kosdaq=350, pause=0.35, 
                 if len(head) >= 9 and head[7] == "외국인순매수":
                     keep = set(tdays)
                     for x in rd:
-                        if len(x) >= 9 and x[0] in keep:
+                        if len(x) >= 9 and x[0] in keep and x[3] != "ETF":  # ETF는 매 실행마다 새로 받아 붙입니다
                             rows.append((x[0], x[1], x[2], x[3], x[4], int(float(x[5])), int(float(x[6])), int(float(x[7] or 0)), int(float(x[8] or 0))))
                             have.add(x[0])
                             names.setdefault(x[1], x[2])
@@ -166,6 +166,54 @@ def fetch_market(out_path, days=250, top_kospi=250, top_kosdaq=350, pause=0.35, 
         w.writerows(rows)
     os.replace(tmp, out_path)
     log(f"market.csv 저장: {len(rows)}행, 종목 {len(names)}개, 순매수 단위는 원")
+
+
+def append_etf(out_path, days=100, top_etf=5000, pause=0.15, fdr=None, keep_codes=()):
+    """KRX(pykrx) 경로는 주식만 받으므로, ETF 가격(수급 없음)은 FinanceDataReader로 받아 같은 market.csv 끝에 붙입니다.
+    기존 파일의 ETF 행은 지우고 새로 받은 행으로 교체합니다. 보유·관심 종목(keep_codes)은 거래대금이 작아도 포함합니다."""
+    if fdr is None:
+        import FinanceDataReader as fdr  # noqa: PLC0415
+    today = dt.datetime.now(KST).date()
+    start = (today - dt.timedelta(days=int(days * 1.7) + 10)).strftime("%Y-%m-%d")
+    lst = retry(lambda: fdr.StockListing("ETF/KR"), what="ETF 목록")
+    if lst is None or len(lst) == 0:
+        raise RuntimeError("ETF 목록을 가져오지 못했습니다.")
+    key = "Amount" if "Amount" in lst.columns else ("Marcap" if "Marcap" in lst.columns else None)
+    if key:
+        lst = lst.sort_values(key, ascending=False)
+    code_col = "Code" if "Code" in lst.columns else "Symbol"
+    lst = lst.copy()
+    lst["_c"] = lst[code_col].astype(str).str.zfill(6)
+    want = set(keep_codes)
+    lst = lst[(lst["_c"].isin(want)) | (lst.index.isin(lst.head(top_etf).index))]
+    rows, n = [], 0
+    for _, r in lst.iterrows():
+        code = r["_c"]
+        df = retry(lambda code=code: fdr.DataReader(code, start), tries=2, what=code)
+        if df is None or len(df) < 71:
+            log(f"[ETF 제외] {code} {r.get('Name', '')}: 가격 이력 {0 if df is None else len(df)}일 (71일 미만)")
+            continue
+        nm = str(r.get("Name", code))
+        for idx, x in df.tail(days).iterrows():
+            if float(x["Close"]) <= 0:
+                continue
+            rows.append((idx.strftime("%Y%m%d"), code, nm, "ETF", "ETF", int(x["Close"]), int(x["Volume"]), 0, 0))
+        n += 1
+        time.sleep(pause)
+    if n < 20:
+        raise RuntimeError(f"받은 ETF가 너무 적습니다({n}개). ETF는 건너뜁니다.")
+    with open(out_path, encoding="utf-8", newline="") as f:
+        rd = csv.reader(f)
+        head = next(rd)
+        base = [x for x in rd if len(x) >= 9 and x[3] != "ETF"]
+    tmp = out_path + ".tmp"
+    with open(tmp, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(head)
+        w.writerows(base)
+        w.writerows(rows)
+    os.replace(tmp, out_path)
+    log(f"ETF {n}개 추가 (가격만, 수급 없음): {len(rows)}행")
 
 
 def fetch_market_fdr(out_path, days=250, top_kospi=1000, top_kosdaq=2000, pause=0.15, fdr=None, top_etf=5000, etf_days=130):
@@ -784,6 +832,16 @@ def main(argv=None):
         try:
             fetch_market(out, a.days, a.top_kospi, a.top_kosdaq, a.pause)
             ok += 1
+            if a.top_etf > 0:
+                try:
+                    wl = []
+                    try:
+                        wl = [c for c, _n in read_watchlist(os.path.join(a.out, "watchlist.txt")) if c]
+                    except Exception:  # noqa: BLE001
+                        pass
+                    append_etf(out, top_etf=a.top_etf, keep_codes=wl)
+                except Exception as e:  # noqa: BLE001
+                    log(f"[ETF 추가 실패] {e}")
         except Exception as e:  # noqa: BLE001
             log(f"[KRX(pykrx) 실패] {e}")
             log("→ 대체 경로(FinanceDataReader, 수급 없이 가격만)로 다시 시도합니다.")
