@@ -929,6 +929,16 @@ var _FD = FD;
         avgWin: avg(wins, (x) => x.pct), avgLoss: avg(loss, (x) => x.pct), avgHold: avg(closed, (x) => x.days), turnover: turnover / capital, capital, equity: last.eq },
     };
   }
+  /* ---------- 가상투자 추적(사용자가 선택한 추천 종목) ----------
+     pos: { code, d0(편입일), p0(편입가), amt(편입금액, 없으면 0), d1/p1(제외일·제외가, 열린 포지션은 null) } */
+  function vpEval(pos, st) {
+    const open = !pos.d1;
+    let last = pos.p1, dl = pos.d1;
+    if (open) { if (st && st.c.length) { last = st.c[st.c.length - 1]; dl = st.d[st.d.length - 1]; } else { last = pos.p0; dl = pos.d0; } }
+    const pct = pos.p0 > 0 ? (last / pos.p0 - 1) * 100 : 0;
+    const days = Math.max(0, Math.round((Date.parse(dl) - Date.parse(pos.d0)) / 86400000));
+    return { open, last, dl, pct, days, pnl: pos.amt > 0 ? pos.amt * (pct / 100) : null, value: pos.amt > 0 ? pos.amt * (1 + pct / 100) : null };
+  }
   const TYPES = { stake: '지분 경쟁', buyback: '자사주 매입', capex: 'CAPEX 완료', turn: '실적 턴어라운드', event: '이벤트', other: '기타' };
   const EVENT_KINDS = { capex: 'CAPEX 완공', effect: '증설 효과 반영', earn: '실적 발표', disc: '공시·IR', agm: '주주총회', macro: '매크로', other: '기타' };
   function dDay(date, today) { const n = daysBetween(today, date); return { n, label: n === 0 ? 'D-Day' : n > 0 ? 'D-' + n : 'D+' + -n }; }
@@ -1033,7 +1043,7 @@ var _FD = FD;
     return { mode, cashCur: an.cashPct / 100, cashTgt: 1 - sumT, rows: out, buy, sell, turnover: Math.max(buy, sell) / an.totalAsset, totalAsset: an.totalAsset };
   }
 
-  Object.assign(FD, { paperTrade, recommend, allocate, rebalance, portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
+  Object.assign(FD, { vpEval, paperTrade, recommend, allocate, rebalance, portfolioRisk, genMacroSample, macroSummary, macroRegime, parseMacro, ideaMetrics, stakeInsight, buybackInsight, capexInsight, CHECK, TYPES, EVENT_KINDS, dDay, daysBetween, addDays });
 })(_FD);
 
 
@@ -1062,12 +1072,12 @@ var _FD = FD;
   /* ---------- 상태 ---------- */
   const SAMPLE_END = '2026-11-20';
   let G = { stocks: [], byCode: {}, dates: [], rankDates: [], asOf: '', isSample: true };
-  let S = { trades: [], cash: 0, nextId: 1, W: Object.assign({}, FD_.DEF_W), cfg: Object.assign({}, FD_.DEF_CFG), ideas: [], events: [], watch: [], profile: 'default', customW: null };
+  let S = { trades: [], cash: 0, nextId: 1, W: Object.assign({}, FD_.DEF_W), cfg: Object.assign({}, FD_.DEF_CFG), ideas: [], events: [], watch: [], vp: [], profile: 'default', customW: null };
   let UI = { tab: 'home', mk: 'KOSPI', rankDate: null, filter: 'all', sheet: null, tf: null, sub: { pf: 'hold', mk: 'rank', idea: 'ideas' }, ideaF: 'all', evShowDone: false, pick: {} };
   let M = { series: {}, asof: '', isSample: true };
   const EXT_ACT = {}, EXT_IN = {};
   let NEWS = null, DART = null, VAL = null, EVT = null;
-  const stateJSON = () => JSON.stringify({ trades: S.trades, cash: S.cash, nextId: S.nextId, W: S.W, cfg: S.cfg, ideas: S.ideas, events: S.events, watch: S.watch, profile: S.profile, customW: S.customW });
+  const stateJSON = () => JSON.stringify({ trades: S.trades, cash: S.cash, nextId: S.nextId, W: S.W, cfg: S.cfg, ideas: S.ideas, events: S.events, watch: S.watch, profile: S.profile, customW: S.customW, vp: S.vp });
   const slim = (s) => ({ code: s.code, name: s.name, market: s.market, sector: s.sector, d: s.d, c: s.c, v: s.v, f: s.f, i: s.i });
   const kv = {
     _db: null,
@@ -1130,6 +1140,7 @@ var _FD = FD;
     if (Array.isArray(d.trades)) S.trades = d.trades.filter((t) => t && t.code && t.qty > 0 && t.price > 0);
     if (Array.isArray(d.ideas)) S.ideas = d.ideas.filter((i) => i && i.id && i.title).map((i) => Object.assign({ log: [], checks: {}, buybacks: [], stake: {}, capex: {}, conviction: 3, status: 'watch', type: 'other' }, i));
     if (Array.isArray(d.events)) S.events = d.events.filter((e) => e && e.id && e.date && e.title);
+    S.vp = Array.isArray(d.vp) ? d.vp.filter((x) => x && x.code && x.p0 > 0).map((x) => ({ id: +x.id || 0, code: String(x.code), name: x.name || '', market: x.market || '', d0: x.d0, p0: +x.p0, amt: +x.amt || 0, tgt: +x.tgt || 0, d1: x.d1 || null, p1: x.p1 != null ? +x.p1 : null, s0: +x.s0 || 0 })) : [];
     if (Array.isArray(d.watch)) S.watch = d.watch.filter((w) => w && w.code).map((w) => ({ code: String(w.code), date: w.date || '', px: +w.px || 0, memo: w.memo || '' }));
     S.cash = +d.cash || 0;
     S.nextId = Math.max(+d.nextId || 1, S.trades.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1, S.ideas.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1, S.events.reduce((m, t) => Math.max(m, t.id || 0), 0) + 1);
@@ -1145,7 +1156,7 @@ var _FD = FD;
     try { const c = await kv.get('market'); if (c && c.stocks && c.stocks.length) { mk = c.stocks; src = 'saved'; } } catch (e) { /* 샘플 */ }
     try { const c = await kv.get('macro'); if (c && c.series) mc = c; } catch (e) { /* 샘플 */ }
     try { // 호스팅 환경의 자동 갱신 파일
-      const r = await Promise.race([fetch('data/market.csv', { cache: 'no-cache' }), to(12000)]);
+      const r = await Promise.race([fetch('data/market.csv', { cache: 'no-cache' }), to(40000)]);
       if (r && r.ok) { const p = FD_.parseMarketCSV(await r.text(), 'won'); if (!p.error && (!mk || lastOf(p.stocks) >= lastOf(mk))) { mk = p.stocks; src = 'auto'; kv.set('market', { stocks: p.stocks.map(slim) }); } }
     } catch (e) { /* 파일 없음 */ }
     try {
@@ -1682,7 +1693,7 @@ function viewReco() {
       <div class="row wrap" style="gap:5px;margin-top:3px"><span class="chip g-${x.level}">${esc(x.label)}</span></div>
       <div class="mute" style="font-size:12px;margin-top:4px">${esc(x.reason)}</div></div>
       <div style="text-align:right" class="num"><b style="font-size:16px">${(x.tgt * 100).toFixed(1)}%</b><small style="display:block" class="mute">${o.budget > 0 ? fn(x.shares) + '주 · ' + fwon(x.amount) : ''}</small><div style="margin-top:4px">${ring(x.score, 36)}</div></div></button>
-      <div class="row" style="gap:6px;margin-top:6px"><button class="btn sm soft" data-act="wl-quick" data-code="${x.code}">${S.watch.some((w) => w.code === x.code) ? '★ 관심 중' : '☆ 관심종목'}</button><button class="btn sm ghost" data-act="trade-new" data-code="${x.code}" data-side="buy">매수 기록</button></div></div>`).join('')}
+      <div class="row" style="gap:6px;margin-top:6px"><button class="btn sm soft" data-act="wl-quick" data-code="${x.code}">${S.watch.some((w) => w.code === x.code) ? '★ 관심 중' : '☆ 관심종목'}</button>${S.vp.some((p) => p.code === x.code && !p.d1) ? '<button class="btn sm" data-act="pt-go" aria-label="가상투자 추적 화면으로">✓ 가상투자 중</button>' : `<button class="btn sm soft" data-act="vp-add" data-code="${x.code}">＋ 가상투자 선택</button>`}<button class="btn sm ghost" data-act="trade-new" data-code="${x.code}" data-side="buy">매수 기록</button></div></div>`).join('')}
     ${r.short ? `<div class="hint">조건에 맞는 종목이 ${r.short}개 부족합니다. 시장을 추가하거나 업종당 최대 개수를 늘려 보세요.</div>` : ''}</div>
     <p class="foot">이 화면은 규칙 기반 후보 선별과 비중 계산 예시이며 수익을 보장하지 않습니다. 매수 신호이거나 관망이면서 매력도 55점 이상인 종목만 대상으로 하고, 종목당 한도는 설정값(${S.cfg.maxWeight}%)입니다. 수수료·세금·호가 단위는 반영하지 않았습니다.</p>`;
   return h;
@@ -1777,9 +1788,36 @@ function ptChart(cv) {
   return `<svg viewBox="0 0 ${w} ${h}" style="width:100%;height:auto;display:block" role="img" aria-label="가상투자와 시장 평균 수익 곡선"><line x1="${p}" x2="${w - p}" y1="${base.toFixed(1)}" y2="${base.toFixed(1)}" stroke="var(--line)" stroke-dasharray="3 3"/><path d="${path(b)}" fill="none" stroke="var(--mute)" stroke-width="2" stroke-dasharray="5 3" stroke-linejoin="round"/><path d="${path(a)}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linejoin="round"/></svg>
     <div class="row wrap" style="gap:4px 14px;font-size:12px;margin-top:4px"><span class="ink2" style="white-space:nowrap"><b style="color:var(--accent)">━</b> 가상투자</span><span class="ink2" style="white-space:nowrap"><b style="color:var(--mute)">╍</b> 시장 평균(동일가중)</span><span class="mute num" style="white-space:nowrap;margin-left:auto">${esc(cv[0].d)} ~ ${esc(cv[cv.length - 1].d)}</span></div>`;
 }
+function vpCard() {
+  const open = S.vp.filter((p) => !p.d1), done = S.vp.filter((p) => p.d1).sort((a, b) => (b.d1 > a.d1 ? 1 : -1));
+  let h = `<div class="sec-h"><h2>내 가상투자 추적</h2><span>${open.length}종목 추적 중</span></div><div class="card">`;
+  if (!S.vp.length) return h + '<div class="empty" style="padding:6px"><b>아직 담은 종목이 없습니다</b>포트폴리오 → 추천 포트에서 종목의 "＋ 가상투자 선택"을 누르면 그날 종가로 담고, 제외할 때까지 수익률을 추적합니다.</div></div>';
+  if (open.length) {
+    const ev = open.map((p) => FD_.vpEval(p, G.byCode[p.code])), avg = ev.reduce((s, x) => s + x.pct, 0) / ev.length;
+    const amt = open.reduce((s, p) => s + (p.amt || 0), 0), pnl = ev.reduce((s, x) => s + (x.pnl || 0), 0);
+    h += `<div class="tiles"><div class="tile"><div class="k">평균 수익률</div><div class="v num ${cls(avg)}" style="font-size:17px">${fpct(avg)}</div><div class="s">종목별 단순 평균</div></div>
+      <div class="tile"><div class="k">${amt > 0 ? '평가손익' : '추적 종목'}</div><div class="v num ${amt > 0 ? cls(pnl) : ''}" style="font-size:17px">${amt > 0 ? (pnl > 0 ? '+' : '') + fwon(pnl) : open.length + '개'}</div><div class="s">${amt > 0 ? '편입금액 ' + fwon(amt) : '금액 없이 수익률만 추적'}</div></div></div>`;
+    h += open.map((p) => {
+      const st = G.byCode[p.code], x = FD_.vpEval(p, st), sc = st ? FD_.scoreAt(st, FD_.idxOf(st, G.asOf) != null ? FD_.idxOf(st, G.asOf) : st.c.length - 1, S.W) : null;
+      const sg = sc ? FD_.signal(sc, { held: true, pnlPct: x.pct, cfg: S.cfg }) : null;
+      return `<div style="padding:9px 0;border-top:1px solid var(--line)"><button class="item" style="width:100%;border:0;text-align:left" data-act="stock" data-code="${p.code}" data-date="${G.asOf}"><div class="main" style="min-width:0"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)} <small class="mute">${esc(p.market)}</small></div>
+        <div class="mute num" style="font-size:12px;margin-top:3px">${esc(p.d0)} 편입 · ${fn(p.p0)}원 → ${fn(x.last)}원 · ${x.days}일째</div>
+        <div class="row wrap" style="gap:5px;margin-top:4px">${sg ? `<span class="chip g-${sg.level}">지금 신호 ${esc(sg.label)}</span>` : ''}${sc ? `<span class="chip tag">매력도 ${sc.total.toFixed(0)}</span>` : ''}</div></div>
+        <div style="text-align:right" class="num"><b style="font-size:17px" class="${cls(x.pct)}">${fpct(x.pct)}</b>${x.pnl != null ? `<small class="${cls(x.pnl)}" style="display:block">${x.pnl > 0 ? '+' : ''}${fwon(x.pnl)}</small>` : ''}</div></button>
+        ${sg && (sg.level === 'exit' || sg.level === 'reduce') ? `<div class="hint" style="margin:4px 0 0">${esc(sg.reasons[0] || '')}</div>` : ''}
+        <div class="row" style="gap:6px;margin-top:6px"><button class="btn sm ghost" data-act="vp-ex" data-id="${p.id}">가상투자에서 제외</button></div></div>`;
+    }).join('');
+  }
+  if (done.length) {
+    h += `<div class="sec-h" style="margin-top:12px"><h2 style="font-size:14px">제외한 종목</h2><span>${done.length}건</span></div>`;
+    h += done.slice(0, UI.vpAll ? 100 : 5).map((p) => { const x = FD_.vpEval(p, G.byCode[p.code]); return `<div class="row" style="gap:8px;padding:7px 0;border-top:1px solid var(--line)"><div class="sp" style="min-width:0"><b>${esc(p.name)}</b><div class="mute num" style="font-size:12px">${esc(p.d0)} → ${esc(p.d1)} · ${x.days}일 · ${fn(p.p0)}→${fn(p.p1)}원</div></div><b class="num ${cls(x.pct)}">${fpct(x.pct)}</b><button class="btn sm ghost" data-act="vp-del" data-id="${p.id}" aria-label="기록 삭제">삭제</button></div>`; }).join('');
+    if (done.length > 5 && !UI.vpAll) h += '<button class="btn sm ghost block" style="margin-top:6px" data-act="vp-more">전체 보기</button>';
+  }
+  return h + '<p class="foot">선택한 날의 종가(데이터 기준일)로 편입하고, 데이터가 갱신될 때마다 최신 종가로 수익률을 다시 계산합니다. 제외하면 그때의 종가로 확정됩니다. 수수료·세금은 반영하지 않은 단순 수익률입니다.</p></div>';
+}
 function viewPaper() {
   const opt = (k, vals) => `<div class="row wrap" style="gap:6px;margin-top:8px"><span class="ink2" style="font-size:13px;width:64px">${k[1]}</span>${vals.map(([v, l]) => `<button class="btn sm ${String(PT[k[0]]) === String(v) ? '' : 'ghost'}" data-act="pt-set" data-k="${k[0]}" data-v="${v}" aria-pressed="${String(PT[k[0]]) === String(v)}">${l}</button>`).join('')}</div>`;
-  let h = `<div class="card"><h2>가상투자<small>매력도 신규 매수 후보를 과거에 그대로 따라 샀다면</small></h2>
+  let h = vpCard() + `<div class="card"><h2>과거 재생<small>매력도 신규 매수 후보를 과거에 그대로 따라 샀다면</small></h2>
     ${opt(['start', '기간'], [['max', '최대'], ['6m', '6개월'], ['3m', '3개월']])}${opt(['prof', '가중치'], [['cur', '현재 설정'], ['short', '단기형'], ['long', '중장기형']])}${opt(['n', '종목 수'], [[5, '5'], [8, '8'], [10, '10']])}${opt(['stop', '손절'], [[5, '-5%'], [8, '-8%'], [12, '-12%']])}
     <div class="hint" style="margin-top:8px">신호는 그날 종가로 계산하고 다음 거래일 종가에 체결한다고 가정합니다. 수수료·세금·슬리피지를 반영하고, 신호가 매도·비중축소로 바뀌거나 손절 기준에 닿으면 매도합니다. 값을 바꾸면 바로 다시 계산합니다.</div></div>`;
   const r = ptRun();
@@ -2008,6 +2046,22 @@ Object.assign(EXT_ACT, {
   'macro-import': () => openSheet(sheetMacroImport()),
   'macro-run': () => { const t = $('#mc-text').value.trim(); if (!t) { $('#mc-err').textContent = 'JSON을 붙여넣거나 파일을 선택하세요.'; return; } const r = FD_.parseMacro(t); if (r.error) { $('#mc-err').textContent = r.error; return; } M = Object.assign({}, r.macro, { isSample: false }); kv.set('macro', r.macro); closeSheet(); UI.tab = 'mk'; UI.sub.mk = 'macro'; render(); toast(`지표 ${Object.keys(r.macro.series).length}개를 불러왔습니다.`); },
   'macro-sample': () => { kv.del('macro'); M = Object.assign({}, FD_.genMacroSample(SAMPLE_END), { isSample: true }); render(); toast('샘플 지표로 되돌렸습니다.'); },
+  'vp-add': (el, d) => {
+    const st = G.byCode[d.code]; if (!st || !st.c.length) return toast('이 종목의 가격 자료가 없습니다.');
+    if (S.vp.some((p) => p.code === d.code && !p.d1)) return toast('이미 가상투자 중인 종목입니다.');
+    const o = rcState(), row = recoOf(o).rows.find((x) => x.code === d.code), i = st.c.length - 1;
+    S.vp.push({ id: (S.vp.reduce((m, p) => Math.max(m, p.id || 0), 0) || 0) + 1, code: st.code, name: st.name, market: st.market, d0: st.d[i], p0: st.c[i], amt: row && o.budget > 0 ? Math.round(row.amount || 0) : 0, tgt: row ? row.tgt : 0, d1: null, p1: null });
+    store.save(); rerender(); toast(`${st.name}을(를) 가상투자에 담았습니다. ${st.d[i]} 종가 ${fn(st.c[i])}원부터 추적합니다.`);
+  },
+  'vp-ex': (el, d) => {
+    const p = S.vp.find((x) => x.id === +d.id && !x.d1), st = p && G.byCode[p.code]; if (!p) return;
+    const i = st && st.c.length ? st.c.length - 1 : null;
+    p.d1 = i != null ? st.d[i] : G.asOf; p.p1 = i != null ? st.c[i] : p.p0;
+    const pct = (p.p1 / p.p0 - 1) * 100; store.save(); rerender(); toast(`${p.name} 제외 · 수익률 ${fpct(pct)} 로 확정했습니다.`);
+  },
+  'vp-del': (el, d) => { S.vp = S.vp.filter((x) => x.id !== +d.id); store.save(); rerender(); toast('기록을 삭제했습니다.'); },
+  'vp-more': () => { UI.vpAll = true; rerender(); },
+  'pt-go': () => { UI.tab = 'pf'; UI.sub.pf = 'pt'; rerender(); window.scrollTo(0, 0); },
   'pt-set': (el, d) => { PT[d.k] = (d.k === 'n' || d.k === 'stop') ? +d.v : d.v; PT.all = false; rerender(); },
   'pt-all': () => { PT.all = true; rerender(); },
   'ev-f': (el, d) => { UI.evk = d.k; UI.evAll = false; rerender(); },
