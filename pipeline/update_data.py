@@ -256,6 +256,7 @@ def fetch_macro(out_path, ecos_key=None):
 
     put("us10y", "미국 국채 10년", "%", "D", tryit("us10y", lambda: fred_series("DGS10", s_d)), 400)
     put("usBase", "미국 기준금리(상단)", "%", "D", tryit("usBase", lambda: fred_series("DFEDTARU", s_d)), 400)
+    put("vix", "VIX (미국 변동성지수)", "", "D", tryit("vix", lambda: fred_series("VIXCLS", s_d)), 400)
     cpi = tryit("usCpi", lambda: fred_series("CPIAUCSL", s_m))
     put("usCpi", "미국 소비자물가(전년비)", "%", "M", to_yoy(cpi) if cpi else None, 30)
 
