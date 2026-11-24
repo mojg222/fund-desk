@@ -91,8 +91,28 @@ def fetch_market(out_path, days=250, top_kospi=250, top_kosdaq=350, pause=0.35, 
         except Exception as e:  # noqa: BLE001
             log(f"  업종 분류 생략({mk}): {e}")
 
-    names, rows, failed = {}, [], 0
-    for di, d in enumerate(tdays):
+    # 증분 갱신: 이미 받은 거래일(수급 포함)은 그대로 쓰고, 빠진 날짜만 새로 받습니다. 호출 수가 줄어 KRX 차단·세션 만료를 피하고,
+    # 실패한 날은 다음 실행 때 자동으로 다시 시도됩니다.
+    names, rows, failed, have = {}, [], 0, set()
+    try:
+        if os.path.exists(out_path):
+            with open(out_path, encoding="utf-8", newline="") as f:
+                rd = csv.reader(f)
+                head = next(rd, [])
+                if len(head) >= 9 and head[7] == "외국인순매수":
+                    keep = set(tdays)
+                    for x in rd:
+                        if len(x) >= 9 and x[0] in keep:
+                            rows.append((x[0], x[1], x[2], x[3], x[4], int(float(x[5])), int(float(x[6])), int(float(x[7] or 0)), int(float(x[8] or 0))))
+                            have.add(x[0])
+                            names.setdefault(x[1], x[2])
+    except Exception as e:  # noqa: BLE001
+        log(f"  기존 파일 읽기 실패, 전체를 새로 받습니다: {e}")
+        names, rows, have = {}, [], set()
+    need = [d for d in tdays if d not in have]
+    log(f"기존 {len(have)}일 재사용, 새로 받을 거래일 {len(need)}일")
+    skipped, streak = [], 0
+    for di, d in enumerate(reversed(need)):  # 최신 날짜부터(가장 중요한 날을 먼저 확보)
         day_rows = []
         ok = True
         for mk in ("KOSPI", "KOSDAQ"):
@@ -117,14 +137,26 @@ def fetch_market(out_path, days=250, top_kospi=250, top_kosdaq=350, pause=0.35, 
                 day_rows.append((d, t, names[t], mk, sector.get(t, "-"), int(close), int(vol), int(f), int(i)))
         if ok:
             rows.extend(day_rows)
+            streak = 0
         else:
             failed += 1
+            streak += 1
+            skipped.append(d)
             log(f"  {d} 건너뜀")
+            if streak >= 5:
+                log("  연속 5일 실패: KRX 접속이 막힌 것으로 보고 중단합니다. 받은 날짜까지만 저장하고 나머지는 다음 실행에서 이어 받습니다.")
+                break
         if (di + 1) % 20 == 0:
-            log(f"  진행 {di + 1}/{len(tdays)}")
+            log(f"  진행 {di + 1}/{len(need)}")
         time.sleep(pause)
-    if failed > max(3, len(tdays) * 0.3):
-        raise RuntimeError(f"실패한 거래일이 너무 많습니다({failed}/{len(tdays)}). 기존 파일을 유지합니다.")
+    if need and len(skipped) == len(need) or (not rows):
+        raise RuntimeError(f"새로 받은 거래일이 없습니다({len(skipped)}/{len(need)}일 실패). 기존 파일을 유지합니다.")
+    if skipped:
+        log(f"  ※ 못 받은 날짜 {len(skipped)}일 ({min(skipped)} ~ {max(skipped)}) — 다음 실행에서 다시 시도합니다.")
+    got = sorted({r[0] for r in rows})
+    if got and got[-1] < latest:
+        log(f"  ※ 최신 거래일({latest})이 아직 없습니다. 현재 파일의 마지막 날짜는 {got[-1]}입니다.")
+    rows.sort(key=lambda r: (r[0], r[1]))
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     tmp = out_path + ".tmp"
